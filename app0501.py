@@ -3,9 +3,9 @@ import pandas as pd
 import re
 import io
 
-st.set_page_config(page_title="智能库存分配调度系统 V8.8", layout="wide")
+st.set_page_config(page_title="智能库存分配调度系统 V8.6", layout="wide")
 
-st.title("📦 智能库存分配调度系统 V8.8")
+st.title("📦 智能库存分配调度系统 V8.6")
 
 # --- 1. 侧边栏：仓库调度配置中心 ---
 st.sidebar.header("⚙️ 仓库调度配置中心")
@@ -48,12 +48,11 @@ elif input_method == "手动输入/编辑表格":
     df_demand = st.data_editor(pd.DataFrame([{"SKU": "", "Quantity": 0.0}] * 10), num_rows="dynamic", use_container_width=True)
 
 elif input_method == "上传文件":
-    f = st.file_uploader("上传需求表", type=["xlsx", "csv"], key="d_up")
+    f = st.file_uploader("上传需求表", type=["xlsx", "csv"])
     if f:
         df_demand = pd.read_csv(f) if f.name.endswith('.csv') else pd.read_excel(f)
-        df_demand.columns = [str(c).strip() for c in df_demand.columns]
-        s_col = st.selectbox("需求表：选择 SKU 列", df_demand.columns)
-        q_col = st.selectbox("需求表：选择 数量 列", df_demand.columns)
+        df_demand.columns = [c.strip() for c in df_demand.columns]
+        s_col = st.selectbox("SKU列", df_demand.columns); q_col = st.selectbox("数量列", df_demand.columns)
         df_demand = df_demand.rename(columns={s_col: 'SKU', q_col: 'Quantity'})
 
 # --- 辅助函数 ---
@@ -66,37 +65,28 @@ def get_sku_detail(sku):
 
 # --- 3. 执行调度逻辑 ---
 st.divider()
-st.subheader("第二步：上传库存表并匹配列名")
-inv_f = st.file_uploader("上传库存表 (Kingdee/Vape)", type=["xlsx", "csv"], key="i_up")
+st.subheader("第二步：上传库存表并分析")
+inv_f = st.file_uploader("上传库存表 (Kingdee)", type=["xlsx", "csv"])
 
 if inv_f and not df_demand.empty:
     try:
+        # --- 核心修复：读取并清理所有表头的空格 ---
         df_inv_raw = pd.read_csv(inv_f) if inv_f.name.endswith('.csv') else pd.read_excel(inv_f)
-        
-        # 核心修复：清理表头空格，防止 KeyError
         df_inv_raw.columns = [str(c).strip() for c in df_inv_raw.columns]
-        
-        # 列名自选功能
-        col1, col2 = st.columns(2)
-        with col1:
-            default_sku_idx = list(df_inv_raw.columns).index('SKU') if 'SKU' in df_inv_raw.columns else 0
-            inv_sku_col = st.selectbox("库存表：选择 SKU 对应列", df_inv_raw.columns, index=default_sku_idx)
-        with col2:
-            possible_qty = ['Available For Sale', 'Accounting Available For Sale', 'Quantity']
-            default_qty_idx = 0
-            for pq in possible_qty:
-                if pq in df_inv_raw.columns:
-                    default_qty_idx = list(df_inv_raw.columns).index(pq)
-                    break
-            inv_qty_col = st.selectbox("库存表：选择 库存量 对应列", df_inv_raw.columns, index=default_qty_idx)
 
-        # 检查 Warehouse Name
+        # --- 兼容性检查：确保关键列存在 ---
         if 'Warehouse Name' not in df_inv_raw.columns:
-            st.error(f"❌ 找不到 'Warehouse Name' 列。现有列名为: {list(df_inv_raw.columns)}")
+            st.error(f"❌ 错误：库存表中找不到 'Warehouse Name' 列。当前的列名有：{list(df_inv_raw.columns)}")
             st.stop()
 
-        df_inv = df_inv_raw.copy().rename(columns={inv_sku_col: 'SKU', inv_qty_col: 'Calc_Qty'})
+        df_inv = df_inv_raw.copy()
+        col = 'Available For Sale' if 'Available For Sale' in df_inv.columns else 'Accounting Available For Sale'
         
+        # 再次检查库存量列是否存在
+        if col not in df_inv.columns:
+            st.error(f"❌ 错误：库存表中找不到库存数量列（需为 'Available For Sale' 或 'Accounting Available For Sale'）。当前的列名有：{list(df_inv.columns)}")
+            st.stop()
+
         df_demand['Quantity'] = pd.to_numeric(df_demand['Quantity'], errors='coerce').fillna(0)
         demand_grouped = df_demand.groupby(df_demand.apply(lambda r: get_sku_detail(r['SKU'])[0], axis=1))['Quantity'].sum().to_dict()
         df_inv[['Match_SKU', 'Ver_Priority', 'Clean_SKU']] = df_inv.apply(lambda r: pd.Series(get_sku_detail(r['SKU'])), axis=1)
@@ -107,78 +97,77 @@ if inv_f and not df_demand.empty:
                 wh_names = [n for n in df_inv['Warehouse Name'].unique() if wh_tag in str(n).upper()]
                 for wh in wh_names:
                     wh_stock = df_inv[df_inv['Warehouse Name'] == wh].copy()
-                    # 聚合库存
-                    wh_summary = wh_stock.groupby(['Match_SKU', 'Ver_Priority']).agg({'Calc_Qty': 'sum', 'Clean_SKU': lambda x: "/".join(x.unique())}).unstack(fill_value=0)
-                    
+                    wh_summary = wh_stock.groupby(['Match_SKU', 'Ver_Priority']).agg({col: 'sum', 'Clean_SKU': lambda x: "/".join(x.unique())}).unstack(fill_value=0)
                     for m_sku in list(rem.keys()):
                         if rem[m_sku] <= 0: continue
                         sku_options = wh_stock[wh_stock['Match_SKU'] == m_sku].sort_values(by='Ver_Priority')
                         if sku_options.empty: continue
                         
-                        def get_val(p, field): 
-                            return wh_summary.loc[m_sku, (field, p)] if (m_sku in wh_summary.index and (field, p) in wh_summary.columns) else (0 if field=='Calc_Qty' else "")
-                        
-                        n_avail, n_name = get_val(0, 'Calc_Qty'), get_val(0, 'Clean_SKU')
-                        v_avail = get_val(1, 'Calc_Qty') + get_val(2, 'Calc_Qty')
+                        def get_val(p, field): return wh_summary.loc[m_sku, (field, p)] if (m_sku in wh_summary.index and (field, p) in wh_summary.columns) else (0 if field==col else "")
+                        n_avail, n_name = get_val(0, col), get_val(0, 'Clean_SKU')
+                        v_avail = get_val(1, col) + get_val(2, col)
                         v_name = "/".join(filter(None, [get_val(1, 'Clean_SKU'), get_val(2, 'Clean_SKU')]))
                         
                         take_total = min(rem[m_sku], n_avail + v_avail)
                         if take_total > 0:
-                            logic.append({"标准SKU": m_sku, "分配仓库": wh, "下单总量": take_total, "普通版参考": f"{n_name} (余:{n_avail})" if n_avail > 0 else "-", "YN/MG版参考": f"{v_name} (余:{v_avail})" if v_avail > 0 else "-"})
+                            logic.append({"标准SKU": m_sku, "分配仓库": wh, "下单总量": take_total, "普通版库存参考": f"{n_name} (余:{n_avail})" if n_avail > 0 else "-", "YN/MG版库存参考": f"{v_name} (余:{v_avail})" if v_avail > 0 else "-"})
                             for _, row in sku_options.iterrows():
                                 if rem[m_sku] <= 0: break
-                                item_take = min(rem[m_sku], row['Calc_Qty'])
+                                item_take = min(rem[m_sku], row[col])
                                 if item_take > 0:
                                     guide.append({"下单仓库": wh, "具体下单 SKU": row['Clean_SKU'], "数量": item_take})
                                     rem[m_sku] -= item_take
             return pd.DataFrame(guide), pd.DataFrame(logic), rem
 
-        # 运行方案
+        # 运行方案 A/B 与 方案 C
         df_guide_ab, df_logic_ab, rem_ab = run_allocation(demand_grouped, final_priority)
         
-        # 方案 C 评分逻辑
         wh_scores = []
         for wh in df_inv['Warehouse Name'].unique():
             score = 0
-            wh_inv_s = df_inv[df_inv['Warehouse Name'] == wh].groupby('Match_SKU')['Calc_Qty'].sum()
+            wh_inv_data = df_inv[df_inv['Warehouse Name'] == wh].groupby('Match_SKU')[col].sum()
             for s, q in demand_grouped.items():
-                if wh_inv_s.get(s, 0) >= q: score += 10
-                elif wh_inv_s.get(s, 0) > 0: score += 1
+                if wh_inv_data.get(s, 0) >= q: score += 10
+                elif wh_inv_data.get(s, 0) > 0: score += 1
             wh_scores.append({'name': wh, 'score': score})
         auto_priority = [x['name'] for x in sorted(wh_scores, key=lambda x: x['score'], reverse=True)]
         df_guide_c, df_logic_c, rem_c = run_allocation(demand_grouped, auto_priority)
 
-        # 展示
-        tab_ab, tab_c = st.tabs(["🚀 方案 A/B (手动顺位)", "📦 方案 C (物流最优)"])
+        # 界面展示
+        tab_ab, tab_c = st.tabs(["🚀 方案 A/B：指定顺序优先", "📦 方案 C：物流最优 (最少仓+不拆箱)"])
         with tab_ab:
             st.table(df_guide_ab)
-            with st.expander("逻辑参考"): st.table(df_logic_ab)
+            with st.expander("查看详细分配逻辑"): st.table(df_logic_ab)
         with tab_c:
             st.table(df_guide_c)
-            with st.expander("逻辑参考"): st.table(df_logic_c)
+            with st.expander("查看详细分配逻辑"): st.table(df_logic_c)
 
-        # 下载与缺口
+        # --- 下载与缺口 ---
         st.divider()
         st.subheader("📥 方案导出与缺口明细")
+        
         df_short = pd.DataFrame([{"SKU": k, "未满足数量": v} for k, v in rem_ab.items() if v > 0])
         if not df_short.empty:
-            st.error("库存缺口明细：")
+            st.error("以下产品库存不足：")
             st.table(df_short)
         else:
             st.success("✨ 所有需求均已满足！")
 
-        # 加固下载逻辑
-        buffer = io.BytesIO()
-        with pd.ExcelWriter(buffer, engine='openpyxl') as wr:
-            if not df_guide_ab.empty: df_guide_ab.to_excel(wr, sheet_name='方案AB-指南', index=False)
-            if not df_guide_c.empty: df_guide_c.to_excel(wr, sheet_name='方案C-最优', index=False)
-            if not df_short.empty: df_short.to_excel(wr, sheet_name='缺口表', index=False)
+        # 生成 Excel (加固版下载逻辑)
+        out = io.BytesIO()
+        with pd.ExcelWriter(out, engine='openpyxl') as wr:
+            if not df_guide_ab.empty: df_guide_ab.to_excel(wr, sheet_name='方案AB-傻瓜指南', index=False)
+            if not df_guide_c.empty: df_guide_c.to_excel(wr, sheet_name='方案C-物流最优', index=False)
+            if not df_short.empty: df_short.to_excel(wr, sheet_name='缺口明细', index=False)
+            if not df_logic_ab.empty: df_logic_ab.to_excel(wr, sheet_name='详细参考(供核对)', index=False)
         
-        buffer.seek(0) # 关键：重置指针
+        # 必须重置指针，确保云端下载成功
+        out.seek(0)
+        
         st.download_button(
             label="📥 下载 Excel 完整结果报告",
-            data=buffer,
-            file_name="Dispatch_Report_V8.8.xlsx",
+            data=out.getvalue(),
+            file_name="Inventory_Allocation_Report_V8.6.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
 
