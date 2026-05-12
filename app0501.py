@@ -9,15 +9,21 @@ st.title("📦 智能库存分配调度系统 V8.6")
 
 # --- 1. 侧边栏：仓库调度配置中心 ---
 st.sidebar.header("⚙️ 仓库调度配置中心")
+
 default_order = ["TX", "PHX", "ID", "IL"]
 user_priority = []
 
 for i in range(1, 5):
-    target_wh = st.sidebar.selectbox(f"优先级 {i}", ["默认"] + default_order, key=f"p_{i}")
+    target_wh = st.sidebar.selectbox(
+        f"优先级 {i}",
+        ["默认"] + default_order,
+        key=f"p_{i}"
+    )
     if target_wh != "默认" and target_wh not in user_priority:
         user_priority.append(target_wh)
 
 final_priority = user_priority + [w for w in default_order if w not in user_priority]
+
 st.sidebar.write("手动执行顺序：", " -> ".join(final_priority))
 
 enable_variant_match = st.sidebar.checkbox("开启多版本兼容 (YN/MG)", value=True)
@@ -26,7 +32,12 @@ variant_prefixes = ["YN", "MG"]
 
 # --- 2. 需求录入板块 ---
 st.subheader("第一步：录入订单需求")
-input_method = st.radio("录入方式", ["自由文本提取", "手动输入/编辑表格", "上传文件"], horizontal=True)
+
+input_method = st.radio(
+    "录入方式",
+    ["自由文本提取", "手动输入/编辑表格", "上传文件"],
+    horizontal=True
+)
 
 df_demand = pd.DataFrame(columns=["SKU", "Quantity"])
 
@@ -39,9 +50,11 @@ if input_method == "自由文本提取":
         all_skus = list(matches)
 
         for i, m in enumerate(all_skus):
-            sku, end_pos = m.group("sku"), m.end()
+            sku = m.group("sku")
+            end_pos = m.end()
             next_start = all_skus[i + 1].start() if i + 1 < len(all_skus) else len(raw_text)
             sub_text = raw_text[end_pos:next_start]
+
             qty_m = re.search(r"(?<!\$)(?P<qty>\d+\.?\d*)", sub_text)
 
             if qty_m:
@@ -93,10 +106,8 @@ def get_sku_detail(sku):
 
 def safe_display_df(df):
     """
-    修复 Streamlit Cloud / Arrow 对混合类型列的报错：
-    Invalid value '0' for dtype 'str'
-
-    只影响前端展示，不改变原始计算和导出逻辑。
+    修复 Streamlit Cloud / Arrow 对混合类型列的报错。
+    只影响前端展示，不改变计算和导出结果。
     """
     if df is None or df.empty:
         return df
@@ -112,6 +123,7 @@ def safe_display_df(df):
 
 # --- 3. 执行调度逻辑 ---
 st.divider()
+
 inv_f = st.file_uploader("上传库存表 (Kingdee)", type=["xlsx", "csv"])
 
 if inv_f and not df_demand.empty:
@@ -137,7 +149,7 @@ if inv_f and not df_demand.empty:
             st.error("❌ 错误：库存表中找不到 'Available For Sale' 或 'Accounting Available For Sale' 列。")
             st.stop()
 
-        # --- 数据强制转换，防止云端报错 ---
+        # --- 数据清洗 ---
         df_inv["SKU"] = df_inv["SKU"].astype(str).str.strip()
         df_inv["Warehouse Name"] = df_inv["Warehouse Name"].astype(str).str.strip()
         df_inv[col] = pd.to_numeric(df_inv[col], errors="coerce").fillna(0)
@@ -145,7 +157,6 @@ if inv_f and not df_demand.empty:
         df_demand["SKU"] = df_demand["SKU"].astype(str).str.strip()
         df_demand["Quantity"] = pd.to_numeric(df_demand["Quantity"], errors="coerce").fillna(0)
 
-        # 去掉空 SKU 和 0 数量
         df_demand = df_demand[
             (df_demand["SKU"] != "") &
             (df_demand["SKU"].str.lower() != "nan") &
@@ -156,14 +167,20 @@ if inv_f and not df_demand.empty:
             st.warning("⚠️ 需求表为空，或没有有效的 SKU / 数量。")
             st.stop()
 
+        # --- 标准化需求 SKU ---
         demand_grouped = df_demand.groupby(
             df_demand.apply(lambda r: get_sku_detail(r["SKU"])[0], axis=1)
         )["Quantity"].sum().to_dict()
 
+        # --- 标准化库存 SKU ---
         df_inv[["Match_SKU", "Ver_Priority", "Clean_SKU"]] = df_inv.apply(
             lambda r: pd.Series(get_sku_detail(r["SKU"])),
             axis=1
         )
+
+        df_inv["Match_SKU"] = df_inv["Match_SKU"].astype(str)
+        df_inv["Clean_SKU"] = df_inv["Clean_SKU"].astype(str)
+        df_inv["Ver_Priority"] = pd.to_numeric(df_inv["Ver_Priority"], errors="coerce").fillna(0).astype(int)
 
         # --- 核心分配逻辑 ---
         def run_allocation(rem_demand, wh_list):
@@ -180,15 +197,30 @@ if inv_f and not df_demand.empty:
                 for wh in wh_names:
                     wh_stock = df_inv[df_inv["Warehouse Name"] == wh].copy()
 
+                    if wh_stock.empty:
+                        continue
+
+                    # 关键修复：
+                    # 不能使用 unstack(fill_value=0)，否则 Clean_SKU 文字字段也会被填成数字 0
                     wh_summary = (
                         wh_stock
                         .groupby(["Match_SKU", "Ver_Priority"])
                         .agg({
                             col: "sum",
-                            "Clean_SKU": lambda x: "/".join(pd.Series(x).dropna().astype(str).unique())
+                            "Clean_SKU": lambda x: "/".join(
+                                pd.Series(x).dropna().astype(str).unique()
+                            )
                         })
-                        .unstack(fill_value=0)
+                        .unstack()
                     )
+
+                    # 数量字段缺失填 0
+                    if col in wh_summary.columns.get_level_values(0):
+                        wh_summary[col] = wh_summary[col].fillna(0)
+
+                    # 文字字段缺失填空字符串
+                    if "Clean_SKU" in wh_summary.columns.get_level_values(0):
+                        wh_summary["Clean_SKU"] = wh_summary["Clean_SKU"].fillna("")
 
                     for m_sku in list(rem.keys()):
                         if rem[m_sku] <= 0:
@@ -209,7 +241,10 @@ if inv_f and not df_demand.empty:
                                 if pd.isna(val):
                                     return 0 if field == col else ""
 
-                                return val
+                                if field == col:
+                                    return float(val)
+
+                                return str(val)
 
                             return 0 if field == col else ""
 
@@ -218,8 +253,8 @@ if inv_f and not df_demand.empty:
 
                         v_avail = get_val(1, col) + get_val(2, col)
                         v_name = "/".join(filter(None, [
-                            str(get_val(1, "Clean_SKU")),
-                            str(get_val(2, "Clean_SKU"))
+                            get_val(1, "Clean_SKU"),
+                            get_val(2, "Clean_SKU")
                         ]))
 
                         take_total = min(rem[m_sku], n_avail + v_avail)
@@ -237,7 +272,8 @@ if inv_f and not df_demand.empty:
                                 if rem[m_sku] <= 0:
                                     break
 
-                                item_take = min(rem[m_sku], row[col])
+                                available_qty = float(row[col])
+                                item_take = min(rem[m_sku], available_qty)
 
                                 if item_take > 0:
                                     guide.append({
@@ -250,10 +286,13 @@ if inv_f and not df_demand.empty:
 
             return pd.DataFrame(guide), pd.DataFrame(logic), rem
 
-        # --- 方案 A/B ---
-        df_guide_ab, df_logic_ab, rem_ab = run_allocation(demand_grouped, final_priority)
+        # --- 方案 A/B：指定顺序优先 ---
+        df_guide_ab, df_logic_ab, rem_ab = run_allocation(
+            demand_grouped,
+            final_priority
+        )
 
-        # --- 方案 C ---
+        # --- 方案 C：物流最优 ---
         wh_scores = []
 
         for wh in df_inv["Warehouse Name"].unique():
@@ -266,9 +305,11 @@ if inv_f and not df_demand.empty:
             )
 
             for s, q in demand_grouped.items():
-                if wh_inv_part.get(s, 0) >= q:
+                available = wh_inv_part.get(s, 0)
+
+                if available >= q:
                     score += 10
-                elif wh_inv_part.get(s, 0) > 0:
+                elif available > 0:
                     score += 1
 
             wh_scores.append({
@@ -284,7 +325,10 @@ if inv_f and not df_demand.empty:
             )
         ]
 
-        df_guide_c, df_logic_c, rem_c = run_allocation(demand_grouped, auto_priority)
+        df_guide_c, df_logic_c, rem_c = run_allocation(
+            demand_grouped,
+            auto_priority
+        )
 
         # --- 界面展示 ---
         tab_ab, tab_c = st.tabs([
