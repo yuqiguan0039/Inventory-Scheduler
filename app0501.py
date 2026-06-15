@@ -30,6 +30,11 @@ st.sidebar.write("Manual Allocation Order:", " -> ".join(final_priority))
 enable_variant_match = st.sidebar.checkbox("Enable Variant Matching (YN/MG)", value=True)
 variant_prefixes = ["YN", "MG"]
 
+# 将查 B- 库存的选项移到侧边栏，使其永远可见 (已修改为英文)
+st.sidebar.divider()
+st.sidebar.subheader("📦 Shortage Report Settings")
+check_b_inventory = st.sidebar.checkbox("🔍 Auto-check alternative B- (Box) inventory for short C- SKUs", value=False)
+
 
 # --- 2. Demand Input Section ---
 st.subheader("Step 1: Input Order Demand")
@@ -370,9 +375,6 @@ if inv_f and not df_demand.empty:
         df_guide_ab = sort_by_original_order(df_guide_ab)
         df_guide_c = sort_by_original_order(df_guide_c)
 
-        # 在展示前，由于后台导出的 Excel 不需要保留 "Original Demand SKU" 辅助列，我们在前端展示或导出前灵活处理
-        # 为了配合高亮，我们把 Original Demand SKU 放在前端展示中，确认完后一目了然
-
         # --- Display Results ---
         tab_ab, tab_c = st.tabs([
             "🚀 Plan A/B: Manual Priority Allocation",
@@ -381,7 +383,6 @@ if inv_f and not df_demand.empty:
 
         with tab_ab:
             if not df_guide_ab.empty:
-                # 重新调整下前端展示列顺序，并将 st.table 升级为 st.dataframe 以渲染高亮
                 show_cols = ["Warehouse", "Original Demand SKU", "Order SKU", "Quantity"]
                 df_disp_ab = safe_display_df(df_guide_ab[show_cols])
                 st.dataframe(style_variant_rows(df_disp_ab), use_container_width=True, height=400)
@@ -402,17 +403,61 @@ if inv_f and not df_demand.empty:
             with st.expander("View Detailed Allocation Logic"):
                 st.dataframe(safe_display_df(df_logic_c), use_container_width=True)
 
+        # ==========================================
+        # 📥 缺货报表模块 (读取 Sidebar 选项并拆分仓库显示)
+        # ==========================================
         st.divider()
         st.subheader("📥 Export & Shortage Report")
 
-        df_short = pd.DataFrame([
-            {
-                "SKU": str(k),
-                "Unfulfilled Quantity": float(v)
-            }
-            for k, v in rem_ab.items()
-            if v > 0
-        ])
+        shortage_data = []
+        for k, v in rem_ab.items():
+            if v > 0:
+                record = {
+                    "SKU": str(k),
+                    "Unfulfilled Quantity": float(v)
+                }
+                
+                # 如果用户在 Sidebar 勾选了选项，则去寻找对应的 B- 产品库存
+                if check_b_inventory:
+                    sku_str = str(k).strip().upper()
+                    target_b_sku = None
+                    
+                    # 规则：只有以 "C-" 开头的 SKU，才去寻找对应的 B- 库存
+                    if sku_str.startswith("C-"):
+                        suffix = sku_str[2:] # 截取 "C-" 后面的所有字符
+                        target_b_sku = f"B-{suffix}"
+                    
+                    if target_b_sku:
+                        # 筛选出原始库存表中目标 B- SKU 的数据
+                        b_stock_df = df_inv[
+                            (df_inv["SKU"].str.upper() == target_b_sku) | 
+                            (df_inv["Match_SKU"].str.upper() == target_b_sku)
+                        ]
+                        
+                        record["Alternative B- SKU"] = target_b_sku
+                        
+                        if not b_stock_df.empty:
+                            # 按仓库分组求和
+                            wh_breakdown = b_stock_df.groupby("Warehouse Name")[col].sum()
+                            # 过滤掉库存小于等于0的仓库
+                            wh_breakdown = wh_breakdown[wh_breakdown > 0]
+                            
+                            total_b_stock = wh_breakdown.sum()
+                            record["Total B- Inventory (Box)"] = float(total_b_stock)
+                            
+                            if total_b_stock > 0:
+                                # 生成类似 "TX: 50, PHX: 20" 的格式化字符串
+                                breakdown_str = ", ".join([f"{wh}: {int(qty)}" for wh, qty in wh_breakdown.items()])
+                                record["B- Stock Breakdown"] = breakdown_str
+                            else:
+                                record["B- Stock Breakdown"] = "No stock"
+                        else:
+                            record["Total B- Inventory (Box)"] = 0.0
+                            record["B- Stock Breakdown"] = "No stock"
+                
+                shortage_data.append(record)
+
+        df_short = pd.DataFrame(shortage_data)
 
         if not df_short.empty:
             st.error("The following SKUs have insufficient inventory:")
@@ -420,11 +465,10 @@ if inv_f and not df_demand.empty:
         else:
             st.success("✨ All demands have been fulfilled!")
 
-        # --- Export Excel (清洗掉辅助列，保持干净的用户导出格式) ---
+        # --- Export Excel ---
         out = io.BytesIO()
         with pd.ExcelWriter(out, engine="openpyxl") as wr:
             if not df_guide_ab.empty:
-                # 导出时去掉技术辅助列，只保留最干净的 3 列结果
                 export_cols = ["Warehouse", "Order SKU", "Quantity"]
                 df_guide_ab[export_cols].to_excel(wr, sheet_name="PlanAB_OrderGuide", index=False)
 
