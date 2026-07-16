@@ -99,6 +99,137 @@ C-XC25CSPOD-WBG
 C-XC25IP-PB
 ```
 
+## Example 6 - Lost Mary MT35 Percent Header, Case Units, NERA, XCube Mixed Quantities
+
+Observed issue:
+- `Lostmary MT35 0%` is a separate catalog family: `LOST MARY (0%)_MT35000`, SKU prefix `C-LMMT350-`; do not treat it as regular MT35.
+- Lines ending in `1 case` should parse quantity 1 and remove the unit from the flavor text.
+- `Lostmary MT35k` without `0%` should map to regular/Lemonade MT35 candidates, not the 0% family.
+- Mixed quantity blocks should follow current rule: if some lines have quantities and some do not, no-quantity flavor lines are review/0, not auto-added as quantity 1.
+- Exact `+` flavors that exist in the selected family should auto-add; unavailable or cross-family fuzzy guesses must require confirmation.
+
+```text
+Lostmary MT35 0%
+Blue Razz Ice  1 case 
+Baja Splash  1 case
+Miami Mint  1 case 
+Watermelon+  1 case 
+Winter Mint 1  case 
+
+Lostmary MT35k
+Blue Razz Lemonade 1 case 
+Strawberry Dragon Lemonade  1 case 
+Tropical Lemonade  1 case 
+Miami Mint 1
+Strawberry+ 1
+Watermelon+ 1
+Black Mint+  1
+Blue Razz Cotton Carnival 1
+Blue Razz Ice  1
+Classic Tobacco 1
+Mountain Berry 1
+
+Lostmary nera 70k kit
+Blue Razz Ice  1 case 
+Baja Splash & Hawaiian Punch 1 case 
+Cool Mint & Polar Mint 1 case 
+Dragon Strawnana 1 case 
+Juicy Peach Ice & Pineapple Coconut 1 case 
+Miami Mint 1 case 
+Miami Mint & Winter Mint 1 case 
+Strawberry Ice & Strawberry  Watermelon 1 case 
+
+Lostmary Nera70k pod 
+Blackberry Blueberry 1 case 
+Baja Splash 1 case 
+Clear 1 case 
+Dragon strawnana 1 case 
+Golden Berry 1 case
+Pomegranate Blast 1 case 
+Pink & Blue 1 case 
+Pineapple Coconut 1 case 
+Pineapple Passion Orange 1 case 
+Rocket Freeze 1 case 
+Scary Berry 1 case
+
+Xcube crystal pod 35k
+Blueberry Apple Cobbler  1 case 
+Black Mint 1 case 
+Florida Orange 1 case 
+Mountain Berry 1 case
+Peach Berry 1 case 
+Sour Apple Ice 1 case 
+Vanilla 1 case 
+Watermelon Ice 1
+Mexican Mango 1
+White Gummy 1
+Cool Mint 1
+Clear 1
+Watermelon Bubble Gum 1
+Pineapple Coconut 1 
+Strawberry Cupcake 1
+Gummy Bear 1
+Grape 1
+Blueberry Sour Raspberry
+Rocket Freeze
+```
+
+Critical exact outputs to preserve after fixing:
+
+```text
+C-LMMT350-BRI
+C-LMMT350-BS
+C-LMMT350-MM
+C-LMMT350-W+
+C-LMMT350-WM
+C-LMMT35LE-BRL
+C-LMMT35LE-SDL
+C-LMMT35LE-TL
+C-LMNFK70-BRI
+C-LMNFK70-BSHP
+C-LMNFK70-CMPM
+C-LMNFK70-DS
+C-LMNFK70-JPPC
+C-LMNFK70-MM
+C-LMNFK70-MMWM
+C-LMNFK70-SISW
+C-LMNFP70-BB
+C-LMNFP70-BS
+C-LMNFP70-CLEA
+C-LMNFP70-DS
+C-LMNFP70-GB
+C-LMNFP70-PB
+C-LMNFP70-PBLU
+C-LMNFP70-PC
+C-LMNFP70-PPO
+C-LMNFP70-RF
+C-LMNFP70-SB
+C-XC25CSPOD-BAC
+C-XC25CSPOD-BM
+C-XC25CSPOD-FO
+C-XC25CSPOD-MB
+C-XC25CSPOD-PB
+C-XC25CSPOD-SAI
+C-XC25CSPOD-VANI
+C-XC25CSPOD-WI
+C-XC25CSPOD-MMG
+C-XC25CSPOD-WG
+C-XC25CSPOD-CM
+C-XC25CSPOD-CLEA
+C-XC25CSPOD-WBG
+C-XC25CSPOD-PC
+C-XC25CSPOD-SC
+C-XC25CSPOD-GB
+C-XC25CSPOD-GRAP
+```
+
+Expected review candidates:
+
+```text
+Blueberry Sour Raspberry
+Rocket Freeze
+```
+
 ## Example 3 - XCube Crystal Kit Without Off Stamp Prefix
 
 Expected:

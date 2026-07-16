@@ -82,7 +82,14 @@ def iter_examples(markdown_text):
             for line in blocks[1].splitlines()
             if line.strip()
         ]
-        yield title, raw_text, expected_skus
+        expected_review_inputs = []
+        if "Expected review candidates" in part and len(blocks) >= 3:
+            expected_review_inputs = [
+                line.strip()
+                for line in blocks[2].splitlines()
+                if line.strip()
+            ]
+        yield title, raw_text, expected_skus, expected_review_inputs
 
 
 def main():
@@ -94,22 +101,49 @@ def main():
         raise RuntimeError(catalog_error)
 
     failures = []
-    for title, raw_text, expected_skus in iter_examples(EXAMPLES_PATH.read_text()):
+    for title, raw_text, expected_skus, expected_review_inputs in iter_examples(
+        EXAMPLES_PATH.read_text()
+    ):
         rows, parser_name, review_rows = namespace["parse_demand_with_local_fallback"](
             raw_text,
             catalog_df,
         )
         found_skus = {str(row.get("SKU", "")).strip() for row in rows}
         missing = [sku for sku in expected_skus if sku not in found_skus]
+        needed_review_rows = [
+            row for row in review_rows if bool(row.get("Need Review", False))
+        ]
+        missing_review_inputs = []
+        for expected_input in expected_review_inputs:
+            expected_norm = namespace["normalize_match_text"](expected_input)
+            matched = any(
+                expected_norm
+                and expected_norm in namespace["normalize_match_text"](
+                    " ".join([
+                        str(row.get("Input", "")),
+                        str(row.get("Parsed Flavor", "")),
+                        str(row.get("Matched Flavor", "")),
+                    ])
+                )
+                for row in needed_review_rows
+            )
+            if not matched:
+                missing_review_inputs.append(expected_input)
         total_quantity = sum(float(row.get("Quantity", 0) or 0) for row in rows)
-        review_count = sum(1 for row in review_rows if row.get("Need Review"))
-        status = "PASS" if not missing else "FAIL"
+        review_count = len(needed_review_rows)
+        status = "PASS" if not missing and not missing_review_inputs else "FAIL"
         print(
             f"{status}: {title} | parser={parser_name} | "
             f"rows={len(rows)} | qty={total_quantity:g} | review={review_count}"
         )
         if missing:
             print(f"  Missing expected SKU(s): {', '.join(missing)}")
+        if missing_review_inputs:
+            print(
+                "  Missing expected review candidate(s): "
+                + ", ".join(missing_review_inputs)
+            )
+        if missing or missing_review_inputs:
             failures.append((title, missing))
 
     if failures:
