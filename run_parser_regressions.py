@@ -14,7 +14,7 @@ import pandas as pd
 from openpyxl import load_workbook
 
 
-APP_PATH = Path(__file__).with_name("app0518_smart_local.py")
+APP_PATH = Path(__file__).with_name("app0501.py")
 EXAMPLES_PATH = Path(__file__).with_name("parser_regression_examples.md")
 
 
@@ -31,6 +31,7 @@ def load_parser_namespace():
     tree = ast.parse(source)
     keep_assignments = {
         "DEFAULT_PRODUCT_CATALOG_PATH",
+        "DEFAULT_BRAND_ALIAS_PATH",
         "DEFAULT_TEMPLATE_PATH",
         "PRODUCT_HEADER_ALIASES",
         "PRODUCT_GROUP_ALIASES",
@@ -41,7 +42,12 @@ def load_parser_namespace():
     selected_nodes = []
     for node in tree.body:
         if isinstance(node, ast.Assign):
-            names = {target.id for target in node.targets if isinstance(target, ast.Name)}
+            names = {
+                child.id
+                for target in node.targets
+                for child in ast.walk(target)
+                if isinstance(child, ast.Name)
+            }
             if names & keep_assignments:
                 selected_nodes.append(node)
         elif isinstance(node, ast.FunctionDef):

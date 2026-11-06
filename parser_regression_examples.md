@@ -284,25 +284,25 @@ Critical exact outputs:
 
 ```text
 C-LMMT35-BS
+C-LMMT35-BB+
+C-LMMT35-BRI
+C-LMMT35-BM+
 C-LMMT35-KPF
 C-LMMT35-RF
 C-LMMT35-SO
 C-LMMT35-WM
 C-LMMT35-MM
 C-LMMT35-RP
+C-LMMT35-WG
 C-LMMT35-WP
 ```
 
 Expected review candidates:
 
 ```text
-Blackberry blueberry
-Blue RAZ ice
 Black Raz lemon
-Black mint
 Golden Bery
 Mountains berry
-White Gami
 ```
 
 ## Example 5 - Classic XCube Pod Should Search Classic, Sweet, And Ice

@@ -6,6 +6,7 @@ import io
 import json
 import os
 import getpass
+import importlib
 import sys
 from difflib import SequenceMatcher
 from copy import copy
@@ -17,6 +18,25 @@ from openpyxl.formula.translate import Translator
 from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
+
+from order_history import record_order_answer, record_order_detail
+import upload_processing as _upload_processing
+
+# Streamlit reruns in the same Python process. Reload this small local helper so
+# newly added warehouse/upload rules are available without restarting the app.
+importlib.reload(_upload_processing)
+
+from upload_processing import (
+    MAX_BATCH_UPLOADS,
+    build_warehouse_sequence,
+    common_inventory_columns,
+    deduplicate_uploaded_files,
+    filter_inventory_warehouses,
+    find_cross_file_inventory_conflicts,
+    read_inventory_upload,
+    uploaded_file_fingerprint,
+    warehouse_region,
+)
 
 
 def initialize_openai_api_key_from_terminal():
@@ -100,13 +120,50 @@ else:
         "warehouse allocation are not required."
     )
 
-enable_variant_match = st.sidebar.checkbox("Enable Variant Matching (YN/MG)", value=True)
+enable_variant_match = st.sidebar.checkbox(
+    "Allow alternative versions when preferred stock is short",
+    value=True,
+    help=(
+        "The requested/original SKU version is always checked first. When enabled, "
+        "other Regular/YN/MG versions may be used next. An 'Only' instruction in "
+        "the order always excludes versions that were not requested."
+    ),
+)
 variant_prefixes = ["YN", "MG"]
+
+include_storage_warehouses = st.sidebar.toggle(
+    "Include storage warehouses",
+    value=False,
+    key="include_storage_warehouses",
+    help=(
+        "Off by default: only standard _SALE warehouses are used. When on, "
+        "each region uses _SALE first and _STORAGE second. _LOCAL_ and all "
+        "other warehouse types are always ignored."
+    ),
+)
+
+allow_subhalf_case = st.sidebar.toggle(
+    "Allow allocations below 0.5 cs",
+    value=False,
+    key="allow_subhalf_case",
+    help=(
+        "Off by default: inventory and shipment quantities below 0.5 cs are "
+        "not allocated. Turn this on only when smaller partial-case shipments "
+        "are operationally allowed."
+    ),
+)
 
 # 将查 B- 库存的选项移到侧边栏，使其永远可见 (已修改为英文)
 st.sidebar.divider()
 st.sidebar.subheader("📦 Shortage Report Settings")
-check_b_inventory = st.sidebar.checkbox("🔍 Auto-check alternative B- (Box) inventory for short C- SKUs", value=False)
+check_b_inventory = st.sidebar.checkbox(
+    "🔍 Check B- Box inventory for short C- SKUs (Regular/YN/MG)",
+    value=False,
+    help=(
+        "Reference only; it does not automatically fill the order. The report "
+        "follows the requested version policy and lists actual Box SKUs by warehouse."
+    ),
+)
 
 
 st.sidebar.divider()
@@ -126,110 +183,80 @@ ai_model = st.sidebar.text_input(
 DEFAULT_PRODUCT_CATALOG_PATH = (
     Path(__file__).resolve().parent / "Product Catalog.xlsx"
 )
+DEFAULT_BRAND_ALIAS_PATH = Path(__file__).resolve().parent / "brand_aliases.xlsx"
 
-PRODUCT_HEADER_ALIASES = {
-    "35KPOD": "OFF STAMP X-CUBE POD (CRYSTAL)_35000",
-    "OFFSTAMPXCUBE35000CRYSTALKIT": "OFF STAMP X-CUBE KIT (CRYSTAL)_35000",
-    "OFFSTAMPXCUBE35000CRYSTALPOD": "OFF STAMP X-CUBE POD (CRYSTAL)_35000",
-    "OFFSTAMPCRYSTALPOD": "OFF STAMP X-CUBE POD (CRYSTAL)_35000",
-    "XCUBE35000CRYSTALKIT": "OFF STAMP X-CUBE KIT (CRYSTAL)_35000",
-    "XCUBECRYSTALKIT": "OFF STAMP X-CUBE KIT (CRYSTAL)_35000",
-    "XCUBE35000CRYSTALPOD": "OFF STAMP X-CUBE POD (CRYSTAL)_35000",
-    "XCUBE35KCRYSTALPOD": "OFF STAMP X-CUBE POD (CRYSTAL)_35000",
-    "XCUBECRYSTALPOD": "OFF STAMP X-CUBE POD (CRYSTAL)_35000",
-    "XCUBECRYSTALPOD35K": "OFF STAMP X-CUBE POD (CRYSTAL)_35000",
-    "OFFSTAMPCLASSICXCUBEPODS": "OFF STAMP X-CUBE POD (CLASSIC)_25000",
-    "OFFSTAMPXCUBECRYSTALPODS": "OFF STAMP X-CUBE POD (CRYSTAL)_35000",
-    "OFFSTAMPXCUBE35000CRYSTALPODS": "OFF STAMP X-CUBE POD (CRYSTAL)_35000",
-    "OFFSTAMPCRYSTALPOD35K": "OFF STAMP X-CUBE POD (CRYSTAL)_35000",
-    "CLASSICXCUBEPOD": [
-        "OFF STAMP X-CUBE POD (CLASSIC)_25000",
-        "OFF STAMP X-CUBE POD (SWEET)_25000",
-        "OFF STAMP X-CUBE POD (ICE)_25000",
-    ],
-    "OFFSTAMPXCUBE25000CLASSICPOD": [
-        "OFF STAMP X-CUBE POD (CLASSIC)_25000",
-        "OFF STAMP X-CUBE POD (SWEET)_25000",
-        "OFF STAMP X-CUBE POD (ICE)_25000",
-    ],
-    "SWEETCUBEPOD": "OFF STAMP X-CUBE POD (SWEET)_25000",
-    "XCUBESWEETPOD": "OFF STAMP X-CUBE POD (SWEET)_25000",
-    "ICECUBEPOD": "OFF STAMP X-CUBE POD (ICE)_25000",
-    "ICEPOD": "OFF STAMP X-CUBE POD (ICE)_25000",
-    "XCUBEICEPOD": "OFF STAMP X-CUBE POD (ICE)_25000",
-    "IJOYKITMGXP100000": "IJOY KIT MG_XP100000",
-    "IJOYXP100000": "IJOY KIT MG_XP100000",
-    "IJOYXP100K": "IJOY KIT MG_XP100000",
-    "IJOYXP50000": "IJOY_XP50000",
-    "IJOYXP50K": "IJOY_XP50000",
-    "MT15": [
-        "LOST MARY (TURBO)_MT15000",
-        "LOST MARY (THERMAL EDITION)_MT15000",
-    ],
-    "MT15000": [
-        "LOST MARY (TURBO)_MT15000",
-        "LOST MARY (THERMAL EDITION)_MT15000",
-    ],
-    "LOSTMARYMT15000": [
-        "LOST MARY (TURBO)_MT15000",
-        "LOST MARY (THERMAL EDITION)_MT15000",
-    ],
-    "LOSTMARYMT15000TURBO": "LOST MARY (TURBO)_MT15000",
-    "LOSTMARYMT15000THERMALEDITION": "LOST MARY (THERMAL EDITION)_MT15000",
-    "MT350": "LOST MARY (0%)_MT35000",
-    "LOSTMARYMT350": "LOST MARY (0%)_MT35000",
-    "MT35": [
-        "LOST MARY_MT35000",
-        "LOST MARY (LEMONADE EDITION)_MT35000",
-        "LOST MARY (WORLD CUP)_MT35000",
-    ],
-    "MT35K": [
-        "LOST MARY_MT35000",
-        "LOST MARY (LEMONADE EDITION)_MT35000",
-        "LOST MARY (WORLD CUP)_MT35000",
-    ],
-    "LOSTMARYMT35": [
-        "LOST MARY_MT35000",
-        "LOST MARY (LEMONADE EDITION)_MT35000",
-        "LOST MARY (WORLD CUP)_MT35000",
-    ],
-    "LOSTMARYMT35K": [
-        "LOST MARY_MT35000",
-        "LOST MARY (LEMONADE EDITION)_MT35000",
-        "LOST MARY (WORLD CUP)_MT35000",
-    ],
-    "LOSTMARYMT35000": "LOST MARY_MT35000",
-    "LOSTMARYMT35000WORLDCUP": "LOST MARY (WORLD CUP)_MT35000",
-    "LOSTMARYMT35000LEMONADEEDITION": "LOST MARY (LEMONADE EDITION)_MT35000",
-    "NERAKIT": "LOST MARY NERA FULLVIEW KIT_70000",
-    "NERAPOD": "LOST MARY NERA FULLVIEW POD_70000",
-    "LOSTMARYNERA70KKIT": "LOST MARY NERA FULLVIEW KIT_70000",
-    "LOSTMARYNERA70000KIT": "LOST MARY NERA FULLVIEW KIT_70000",
-    "LOSTMARYNERA70KPOD": "LOST MARY NERA FULLVIEW POD_70000",
-    "LOSTMARYNERA70000POD": "LOST MARY NERA FULLVIEW POD_70000",
-    "LOSTMARYNERAFULLVIEWKIT70000": "LOST MARY NERA FULLVIEW KIT_70000",
-    "LOSTMARYNERAFULLVIEWKIT": "LOST MARY NERA FULLVIEW KIT_70000",
-    "LOSTMARYNERAFULLVIEWPOD": "LOST MARY NERA FULLVIEW POD_70000",
-    "LOSTMARYNERAFULLVIEWPOD70000": "LOST MARY NERA FULLVIEW POD_70000",
-    # Short warehouse headings observed in pasted flavor lists.  The
-    # catalog confirms that bare Pulse means the standard 15K family, while
-    # bare PulseX means the standard 25K family (not the separate Pulse X2
-    # 50K family).
-    "PULSE": "GEEK BAR PULSE 15000",
-    "PULSEX": "GEEK BAR PULSE X_25000",
-    "MULTILINECOPULSE225K": "GEEK BAR PULSE 2_25000",
-    "MULTILINECOPULSE225000": "GEEK BAR PULSE 2_25000",
-    "MULTILINECOPULSEX250K": "GEEK BAR PULSE X 2_50000",
-    "MULTILINECOPULSEX25000": "GEEK BAR PULSE X 2_50000",
-    "PULSEX2": "GEEK BAR PULSE X 2_50000",
-    "BURJ": "GEEK BAR BURJ_80000",
-    "CLR": "GEEK BAR CLR 50000",
-    "GEEKBARCLR": "GEEK BAR CLR 50000",
-    "MATEKIT": "GEEK BAR MATE KIT 60000",
-    "GEEKBARMATEKIT": "GEEK BAR MATE KIT 60000",
-    "MATEPOD": "GEEK BAR MATE POD 60000",
-    "GEEKBARMATEPOD": "GEEK BAR MATE POD 60000",
-}
+
+def normalize_brand_alias(value):
+    """Normalize a business-maintained alias for case-insensitive matching."""
+    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+
+
+def load_product_header_aliases(mapping_path):
+    """Load alias -> Brand candidates from the first worksheet of an Excel map."""
+    path = Path(mapping_path)
+    if not path.exists():
+        return {}, f"Brand alias mapping not found: {path.name}"
+
+    try:
+        mapping_df = pd.read_excel(path, sheet_name=0, dtype=str)
+    except Exception as exc:
+        return {}, f"Could not read Brand alias mapping: {exc}"
+
+    brand_columns = [
+        column
+        for column in mapping_df.columns
+        if str(column).strip().upper() == "BRAND"
+    ]
+    if not brand_columns:
+        return {}, "Brand alias mapping must have BRAND as its first column."
+    if str(mapping_df.columns[0]).strip().upper() != "BRAND":
+        return {}, "BRAND must be the first column in the Brand alias mapping."
+
+    brand_column = brand_columns[0]
+    alias_columns = [column for column in mapping_df.columns if column != brand_column]
+    aliases = {}
+
+    for _, row in mapping_df.iterrows():
+        brand = str(row.get(brand_column, "") or "").strip()
+        if not brand or brand.lower() == "nan":
+            continue
+
+        for column in alias_columns:
+            raw_alias = row.get(column)
+            if pd.isna(raw_alias):
+                continue
+            alias_key = normalize_brand_alias(raw_alias)
+            if not alias_key:
+                continue
+            brand_options = aliases.setdefault(alias_key, [])
+            if brand not in brand_options:
+                brand_options.append(brand)
+
+    if not aliases:
+        return {}, "Brand alias mapping contains no usable aliases."
+    return aliases, ""
+
+
+def find_unmatched_alias_brands(product_header_aliases, catalog_df):
+    """Return mapped Brand values that do not exactly match Product Catalog."""
+    if catalog_df is None or catalog_df.empty or "Brand" not in catalog_df.columns:
+        return []
+    catalog_brands = {
+        str(value).strip()
+        for value in catalog_df["Brand"].dropna()
+        if str(value).strip()
+    }
+    mapped_brands = {
+        brand
+        for brand_options in product_header_aliases.values()
+        for brand in catalog_header_options(brand_options)
+    }
+    return sorted(mapped_brands - catalog_brands)
+
+
+PRODUCT_HEADER_ALIASES, PRODUCT_HEADER_ALIAS_ERROR = load_product_header_aliases(
+    DEFAULT_BRAND_ALIAS_PATH
+)
 
 PRODUCT_GROUP_ALIASES = {
     "XCUBECLASSIC": {
@@ -265,17 +292,98 @@ def floor_to_shipment_increment(value, increment=SHIPMENT_INCREMENT):
     return round(steps * float(increment), 10)
 
 
-def choose_variant_shipments(required_quantity, sku_options):
+def allocatable_quantity(value, allow_subhalf=False):
+    """Return usable stock under the selected partial-case policy."""
+    numeric_value = pd.to_numeric(value, errors="coerce")
+    if pd.isna(numeric_value) or float(numeric_value) <= 0:
+        return 0.0
+    if allow_subhalf:
+        return round(float(numeric_value), 10)
+    return floor_to_shipment_increment(numeric_value)
+
+
+def prioritize_fulfillment_warehouses(
+    required_quantity,
+    warehouse_options,
+    allow_subhalf=False,
+):
+    """Move a single warehouse that can fulfill demand ahead of split options."""
+    required = allocatable_quantity(required_quantity, allow_subhalf)
+    options = []
+    for index, option in enumerate(warehouse_options or []):
+        name = str(option.get("Warehouse", "") or "").strip()
+        available = allocatable_quantity(option.get("Available", 0), allow_subhalf)
+        if name:
+            options.append({
+                "Warehouse": name,
+                "Available": available,
+                "Priority": int(option.get("Priority", index)),
+                "Group": option.get("Group"),
+            })
+
+    options.sort(key=lambda option: option["Priority"])
+    if required <= 0:
+        return [option["Warehouse"] for option in options]
+
+    # When warehouse groups are supplied, preserve the region order first.
+    # The no-split preference is then applied only within each region, so a
+    # later region cannot jump ahead of the current region's STORAGE fallback.
+    if any(option.get("Group") is not None for option in options):
+        group_order = []
+        for option in options:
+            group = option.get("Group")
+            if group not in group_order:
+                group_order.append(group)
+        grouped_sequence = []
+        for group in group_order:
+            group_options = [
+                {
+                    "Warehouse": option["Warehouse"],
+                    "Available": option["Available"],
+                    "Priority": option["Priority"],
+                }
+                for option in options
+                if option.get("Group") == group
+            ]
+            grouped_sequence.extend(
+                prioritize_fulfillment_warehouses(
+                    required,
+                    group_options,
+                    allow_subhalf,
+                )
+            )
+        return grouped_sequence
+
+    complete = [
+        option for option in options
+        if option["Available"] + 1e-9 >= required
+    ]
+    if not complete:
+        return [option["Warehouse"] for option in options]
+
+    selected = complete[0]["Warehouse"]
+    return [selected] + [
+        option["Warehouse"] for option in options
+        if option["Warehouse"] != selected
+    ]
+
+
+def choose_variant_shipments(required_quantity, sku_options, allow_subhalf=False):
     """Prefer one version that covers demand; split only when none can."""
-    required = floor_to_shipment_increment(required_quantity)
+    required = allocatable_quantity(required_quantity, allow_subhalf)
     if required <= 0:
         return []
 
     normalized_options = []
     for option in sku_options or []:
         sku = str(option.get("SKU", "") or "").strip()
-        available = floor_to_shipment_increment(option.get("Available", 0))
-        if not sku or available < SHIPMENT_INCREMENT:
+        available = allocatable_quantity(option.get("Available", 0), allow_subhalf)
+        unavailable = (
+            available <= 1e-9
+            if allow_subhalf
+            else available < SHIPMENT_INCREMENT
+        )
+        if not sku or unavailable:
             continue
         normalized_options.append({
             "SKU": sku,
@@ -295,12 +403,21 @@ def choose_variant_shipments(required_quantity, sku_options):
     allocations = []
     remaining = required
     for option in normalized_options:
-        if remaining < SHIPMENT_INCREMENT:
+        if (
+            remaining <= 1e-9
+            if allow_subhalf
+            else remaining < SHIPMENT_INCREMENT
+        ):
             break
-        quantity = floor_to_shipment_increment(
-            min(remaining, option["Available"])
+        quantity = allocatable_quantity(
+            min(remaining, option["Available"]),
+            allow_subhalf,
         )
-        if quantity < SHIPMENT_INCREMENT:
+        if (
+            quantity <= 1e-9
+            if allow_subhalf
+            else quantity < SHIPMENT_INCREMENT
+        ):
             continue
         allocations.append({
             "SKU": option["SKU"],
@@ -316,7 +433,8 @@ def build_subincrement_stock_details(
     match_sku,
     inventory_df,
     allocation_df,
-    inventory_qty_col
+    inventory_qty_col,
+    allow_subhalf=False,
 ):
     """Describe remaining stock that cannot form another 0.5 shipment unit."""
     detail_columns = [
@@ -376,7 +494,7 @@ def build_subincrement_stock_details(
     ).clip(lower=0)
     details["Allocatable Remaining Inventory"] = details[
         "Actual Remaining Inventory"
-    ].apply(floor_to_shipment_increment)
+    ].apply(lambda value: allocatable_quantity(value, allow_subhalf))
     details["Sub-0.5 Remainder"] = (
         details["Actual Remaining Inventory"]
         - details["Allocatable Remaining Inventory"]
@@ -575,7 +693,7 @@ def parse_all_in_stock_series_requests_locally(raw_text):
 
 
 def normalize_match_text(value):
-    return re.sub(r"[^A-Z0-9]+", "", str(value or "").upper())
+    return normalize_brand_alias(value)
 
 
 def normalize_html_space_entities(value):
@@ -589,10 +707,9 @@ def normalize_word_text(value):
 
 def expand_product_header_alias(value):
     text = str(value or "").strip()
-    alias = PRODUCT_HEADER_ALIASES.get(normalize_product_header_key(text))
-    if isinstance(alias, list):
-        return alias[0] if alias else text
-    return alias or text
+    alias = resolve_product_header_alias(text)
+    options = rank_brand_candidates(text, catalog_header_options(alias))
+    return options[0] if options else text
 
 
 def catalog_header_options(value):
@@ -603,10 +720,30 @@ def catalog_header_options(value):
     return []
 
 
-def normalize_product_header_key(value):
+def normalize_product_header_key(value, preserve_trailing_number=False):
     """Normalize numbered product headings while retaining family identity."""
     text = normalize_html_space_entities(value).strip()
     text = re.sub(r"\s+", " ", text)
+    # Customer summaries often append the declared block total to a product
+    # heading (for example "· 5% — 97箱").  The total is not part of the
+    # product alias and must not prevent the heading from being resolved.
+    text = re.sub(
+        r"\s*[·•]?\s*[—–-]\s*\d+(?:\.\d+)?\s*(?:箱|CASES?|CS)\s*$",
+        "",
+        text,
+        flags=re.IGNORECASE,
+    )
+    # 5% is the regular US catalog family.  Unlike 0% and 2%, it is not
+    # written in the Product Catalog Brand, so remove it only for alias lookup.
+    text = re.sub(r"(?:[·•]\s*)?5\s*%", " ", text, flags=re.IGNORECASE)
+    # Common customer wording for the X-Cube replacement pod.  Canonicalize
+    # the descriptor while retaining POD so it cannot fall through to KIT.
+    text = re.sub(
+        r"\bCRYSTAL\s+CUBE\s+REPLACEMENT\s+PODS?\b",
+        "CRYSTAL POD",
+        text,
+        flags=re.IGNORECASE,
+    )
     # PULSE X 2 is a distinct 50K family; do not discard its variant number
     # as if it were a quantity suffix on a generic heading.
     if re.fullmatch(r"PULSE\s*X\s*2", text, flags=re.IGNORECASE):
@@ -626,8 +763,196 @@ def normalize_product_header_key(value):
         text,
         flags=re.IGNORECASE
     )
-    text = re.sub(r"\b\d+(?:\.\d+)?\s*$", "", text)
+    if not preserve_trailing_number:
+        text = re.sub(r"\b\d+(?:\.\d+)?\s*$", "", text)
     return normalize_match_text(text)
+
+
+def detect_version_request(value):
+    """Interpret Regular/YN/MG preference wording without changing the SKU."""
+    text = normalize_word_text(value)
+    has_yn = bool(re.search(r"\bYN\b", text))
+    has_0mg = bool(re.search(r"\b0\s*MG\b", text))
+    has_mg = bool(re.search(r"\bMG\b", text)) and not has_0mg
+    strict = bool(
+        re.search(
+            r"\bONLY\b|只(?:要|看|用|查)|不(?:要|看|用|查)普通|排除普通",
+            str(value or ""),
+            flags=re.IGNORECASE,
+        )
+    )
+    if has_yn and has_0mg:
+        return "YN 0MG", "Only" if strict else "Preferred"
+    if has_0mg:
+        return "0MG", "Only" if strict else "Preferred"
+    if has_yn and has_mg:
+        return "YN/MG", "Only" if strict else "Preferred"
+    if has_yn:
+        return "YN", "Only" if strict else "Preferred"
+    if has_mg:
+        return "MG", "Only" if strict else "Preferred"
+    return None, None
+
+
+def strip_version_request_words(value):
+    """Remove version instructions so the remaining text can match a catalog item."""
+    text = str(value or "")
+    text = re.sub(
+        r"(?:本单|整单|全部|所有)?\s*(?:只要|只看|只用|只查|优先)?\s*"
+        r"(?:YN\s*[/&+]\s*0\s*MG|YN\s+0\s*MG|0\s*MG|"
+        r"YN\s*[/&+]\s*MG|MG\s*[/&+]\s*YN|YN|MG)\s*"
+        r"(?:版本|版|库存|优先|ONLY)?",
+        " ",
+        text,
+        flags=re.IGNORECASE,
+    )
+    text = re.sub(r"\b(?:ONLY|VERSION|PREFERRED?)\b", " ", text, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", text).strip(" ,;:-")
+
+
+def version_from_sku(sku):
+    sku_text = str(sku or "").strip().upper()
+    body = sku_text[2:] if sku_text.startswith(("C-", "B-")) else sku_text
+    if body.startswith("YN0MG"):
+        return "YN 0MG"
+    if body.startswith("0MG"):
+        return "0MG"
+    if body.startswith("YN"):
+        return "YN"
+    if body.startswith("MG"):
+        return "MG"
+    return "Regular"
+
+
+def version_priority_order(requested_version, policy="Preferred", allow_alternatives=True):
+    """Return inventory version codes in the permitted allocation order."""
+    requested = str(requested_version or "Regular").strip().upper()
+    strict = str(policy or "Preferred").strip().lower() == "only"
+    # Nicotine-free inventory is never a fallback for nicotine-bearing stock.
+    # It is considered only when 0MG was explicitly requested.
+    if requested in {"YN 0MG", "YN+0MG", "YN/0MG"}:
+        return [4] if strict or not allow_alternatives else [4, 3]
+    if requested == "0MG":
+        return [3] if strict or not allow_alternatives else [3, 4]
+    if requested in {"YN/MG", "MG/YN"}:
+        return [1, 2]
+    primary = {"REGULAR": 0, "YN": 1, "MG": 2}.get(requested, 0)
+    if strict or not allow_alternatives:
+        return [primary]
+    fallback = {
+        0: [1, 2],
+        1: [0, 2],
+        2: [0, 1],
+    }
+    return [primary] + fallback[primary]
+
+
+def enrich_demand_version_preferences(extracted_rows, review_rows, raw_text):
+    """Attach version intent to parsed demand without changing parser output APIs."""
+    global_version = None
+    global_policy = None
+    for line in str(raw_text or "").splitlines():
+        version, policy = detect_version_request(line)
+        if version and policy == "Only" and re.search(
+            r"本单|整单|全部|所有|只(?:要|看|用|查)|\bONLY\b",
+            line,
+            flags=re.IGNORECASE,
+        ):
+            global_version, global_policy = version, policy
+
+    review_by_sku = {}
+    for row in review_rows or []:
+        sku = str(row.get("Suggested SKU", "") or "").strip().upper()
+        if sku:
+            review_by_sku.setdefault(sku, []).append(row)
+
+    enriched = []
+    for source_row in extracted_rows or []:
+        row = dict(source_row)
+        sku = str(row.get("SKU", "") or "").strip().upper()
+        candidates = review_by_sku.get(sku, [])
+        review = candidates.pop(0) if candidates else {}
+        requested = review.get("Requested Version") or global_version or version_from_sku(sku)
+        policy = review.get("Version Policy") or global_policy or "Preferred"
+        row["Requested Version"] = requested
+        row["Version Policy"] = policy
+        enriched.append(row)
+    return enriched
+
+
+def resolve_product_header_alias(value):
+    """Resolve the full alias before treating a trailing number as quantity."""
+    alias_keys = [
+        normalize_product_header_key(value, preserve_trailing_number=True),
+        normalize_product_header_key(value),
+    ]
+
+    for alias_key in dict.fromkeys(alias_keys):
+        direct_match = PRODUCT_HEADER_ALIASES.get(alias_key)
+        if direct_match:
+            return direct_match
+
+        suffix_keys = [
+            candidate
+            for candidate in PRODUCT_HEADER_ALIASES
+            if len(candidate) >= 5 and alias_key.endswith(candidate)
+        ]
+        if not suffix_keys:
+            continue
+
+        longest_length = max(len(candidate) for candidate in suffix_keys)
+        brand_options = []
+        for candidate in suffix_keys:
+            if len(candidate) != longest_length:
+                continue
+            for brand in catalog_header_options(PRODUCT_HEADER_ALIASES[candidate]):
+                if brand not in brand_options:
+                    brand_options.append(brand)
+        if brand_options:
+            return brand_options
+
+    return None
+
+
+def rank_brand_candidates(input_header, brand_options):
+    """Prefer Brands whose explicit version markers match the input header."""
+    options = list(dict.fromkeys(catalog_header_options(brand_options)))
+    if len(options) < 2:
+        return options
+
+    input_text = normalize_word_text(input_header)
+    marker_patterns = [
+        r"\bYN\b",
+        r"\bMG\b",
+        r"\b0\s*MG\b",
+        r"\b2\b",
+        r"\bPATRIOT\b",
+        r"\bLEMONADE\b",
+        r"\bWORLD\s+CUP\b",
+        r"\bTHERMAL\b",
+        r"\bTURBO\b",
+    ]
+    input_markers = [
+        bool(re.search(pattern, input_text, flags=re.IGNORECASE))
+        for pattern in marker_patterns
+    ]
+
+    def candidate_score(index_and_brand):
+        index, brand = index_and_brand
+        brand_text = normalize_word_text(brand)
+        score = 0
+        for input_has_marker, pattern in zip(input_markers, marker_patterns):
+            brand_has_marker = bool(
+                re.search(pattern, brand_text, flags=re.IGNORECASE)
+            )
+            if input_has_marker:
+                score += 10 if brand_has_marker else -10
+            elif brand_has_marker:
+                score -= 1
+        return (-score, index)
+
+    ranked = sorted(enumerate(options), key=candidate_score)
+    return [brand for _, brand in ranked]
 
 
 def looks_like_product_header(value):
@@ -837,6 +1162,37 @@ def get_quantity_from_line(line):
     return quantity, text_without_qty
 
 
+def extract_default_quantity_instruction(raw_text):
+    """Return a clear global quantity default and its instruction lines."""
+    patterns = [
+        r"(?:没有|没|未)(?:标|写|注明)?(?:数字|数量)(?:的)?(?:全部|都|默认)?(?:为|是|按|算)?\s*(?P<qty>\d+(?:\.\d+)?)\s*(?:箱|cs|case)?",
+        r"(?:其他|其余|剩下)(?:的)?(?:全部|都)?(?:为|是|按|算)?(?:各|每个|每款)?\s*(?P<qty>\d+(?:\.\d+)?)\s*(?:箱|cs|case)?",
+        r"(?:各|每个|每款)\s*(?P<qty>\d+(?:\.\d+)?)\s*(?:箱|cs|case)",
+        r"(?P<qty>\d+(?:\.\d+)?)\s*(?:cases?|cs|cartons?)\s*(?:each|ea)\b",
+        r"(?:each|every)\s*(?:item|sku|flavou?r|one)?\s*(?P<qty>\d+(?:\.\d+)?)\s*(?:cases?|cs|cartons?)\b",
+        r"(?:default|unmarked items?|items? without (?:a )?quantity)\D{0,18}(?P<qty>\d+(?:\.\d+)?)\s*(?:cases?|cs|cartons?)?\b",
+    ]
+    quantity = None
+    instruction_lines = []
+    for raw_line in str(raw_text or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            continue
+        for pattern in patterns:
+            match = re.search(pattern, line, flags=re.IGNORECASE)
+            if not match:
+                continue
+            candidate = float(match.group("qty"))
+            if candidate <= 0:
+                continue
+            if quantity is not None and abs(quantity - candidate) > 1e-9:
+                return None, []
+            quantity = candidate
+            instruction_lines.append(line)
+            break
+    return quantity, instruction_lines
+
+
 def score_catalog_row(row, brand_text, flavor_text, full_text):
     brand_norm = normalize_match_text(brand_text)
     flavor_norm = normalize_match_text(flavor_text)
@@ -887,6 +1243,18 @@ def score_catalog_row(row, brand_text, flavor_text, full_text):
     return min((brand_score * 0.55) + (flavor_score * 0.45) + full_bonus, 1.0)
 
 
+def extract_mg_strengths(value):
+    """Return explicit nicotine strengths such as 30mg without substring collisions."""
+    return {
+        float(match)
+        for match in re.findall(
+            r"(?<!\d)(\d+(?:\.\d+)?)\s*MG\b",
+            str(value or ""),
+            flags=re.IGNORECASE,
+        )
+    }
+
+
 def choose_catalog_match(catalog_df, brand_text, flavor_text, full_text):
     if catalog_df is None or catalog_df.empty:
         return None, 0.0
@@ -894,12 +1262,74 @@ def choose_catalog_match(catalog_df, brand_text, flavor_text, full_text):
     requested_text = normalize_word_text(full_text)
     explicit_box_request = bool(
         re.search(r"\b(?:BOX|BOXES)\b", requested_text)
-        or re.search(r"(?<![A-Z0-9])B-[A-Z0-9]", str(full_text or ""), re.IGNORECASE)
+        # Require the complete B-product-flavor SKU shape.  Flavor names such
+        # as "B-Gum Cotton Carnival" are not requests for B- inventory.
+        or re.search(
+            r"(?<![A-Z0-9])B-[A-Z0-9+&]+-[A-Z0-9+&]+\b",
+            str(full_text or ""),
+            re.IGNORECASE,
+        )
     )
     requested_prefix = "B" if explicit_box_request else "C"
     prefix_df = catalog_df[catalog_df["Prefix"] == requested_prefix]
     if prefix_df.empty:
         return None, 0.0
+
+    # Product-type words in a block heading are hard constraints.  Kit and
+    # replacement pod flavors frequently share the same names, so allowing a
+    # cross-type fuzzy match can silently select the wrong SKU.
+    requested_product_type = None
+    if re.search(r"\bPODS?\b", requested_text):
+        requested_product_type = "POD"
+    elif re.search(r"\bKITS?\b", requested_text):
+        requested_product_type = "KIT"
+    if requested_product_type:
+        type_matches = prefix_df[
+            prefix_df["Brand"].apply(
+                lambda value: requested_product_type
+                in normalize_word_text(value).split()
+            )
+        ]
+        if not type_matches.empty:
+            prefix_df = type_matches
+
+    # Nicotine percentages are also product-family constraints.  Product
+    # Catalog names explicitly mark 0% and 2%; an explicit 5% means the normal
+    # family and must exclude both special versions.
+    percent_match = re.search(r"(?<!\d)(0|2|5)\s*%", str(full_text or ""))
+    if percent_match:
+        requested_percent = percent_match.group(1)
+        brand_series = prefix_df["Brand"].astype(str)
+        if requested_percent in {"0", "2"}:
+            percent_matches = prefix_df[
+                brand_series.str.contains(
+                    rf"\({requested_percent}%\)", case=False, regex=True, na=False
+                )
+            ]
+        else:
+            percent_matches = prefix_df[
+                ~brand_series.str.contains(r"\((?:0|2)%\)", case=False, regex=True, na=False)
+            ]
+        if not percent_matches.empty:
+            prefix_df = percent_matches
+
+    # An explicitly written nicotine strength is a product variant, not a
+    # fuzzy scoring hint. Restrict the candidates first so equal flavor/brand
+    # scores cannot make a 50mg request fall through to an earlier 30mg row.
+    requested_strengths = extract_mg_strengths(full_text)
+    if requested_strengths:
+        strength_mask = prefix_df.apply(
+            lambda row: bool(
+                requested_strengths
+                & extract_mg_strengths(
+                    f"{row.get('Brand', '')} {row.get('Item Name', '')}"
+                )
+            ),
+            axis=1,
+        )
+        strength_matches = prefix_df[strength_mask]
+        if not strength_matches.empty:
+            prefix_df = strength_matches
 
     brand_norm = normalize_match_text(brand_text)
     search_df = prefix_df
@@ -1046,7 +1476,9 @@ def suggest_family_flavor_match(family_df, flavor_text, min_score=0.60):
     return best_row, round(float(best_score), 3)
 
 
-def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
+def parse_known_alias_flavor_blocks(
+    raw_text, catalog_df, min_confidence=0.82, default_quantity=None
+):
     """Parse known product headers, multi-family groups, and flavor lists.
 
     Direct block quantity rule:
@@ -1058,11 +1490,31 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
     catalog-grounded flavors are emitted; unavailable flavors are review rows.
     """
     normalized_raw_text, _ = collapse_repeated_paste(raw_text)
+    local_default, quantity_instruction_lines = extract_default_quantity_instruction(
+        normalized_raw_text
+    )
+    if default_quantity is None:
+        default_quantity = local_default
+    quantity_instruction_lines = set(quantity_instruction_lines)
     lines = [line.strip() for line in normalized_raw_text.splitlines() if line.strip()]
     blocks = []
     current_block = None
+    global_version = None
+    global_version_policy = None
+
+    for candidate_line in lines:
+        requested_version, version_policy = detect_version_request(candidate_line)
+        if requested_version and version_policy == "Only" and re.search(
+            r"本单|整单|全部|所有|只(?:要|看|用|查)|\bONLY\b",
+            candidate_line,
+            flags=re.IGNORECASE,
+        ):
+            global_version = requested_version
+            global_version_policy = version_policy
 
     for line in lines:
+        if line in quantity_instruction_lines:
+            continue
         if extract_declared_order_total(line) is not None:
             continue
         # Product headers often put package size on its own line.  It is
@@ -1075,7 +1527,22 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
         ):
             continue
 
-        alias_key = normalize_product_header_key(line)
+        line_version, line_version_policy = detect_version_request(line)
+        stripped_version_line = strip_version_request_words(line)
+        alias_source = line
+        brand_alias = resolve_product_header_alias(alias_source)
+        if (
+            not brand_alias
+            and line_version in {"0MG", "YN 0MG"}
+            and stripped_version_line
+        ):
+            alias_source = f"{stripped_version_line} 0"
+            brand_alias = resolve_product_header_alias(alias_source)
+        if not brand_alias and line_version and stripped_version_line:
+            alias_source = stripped_version_line
+            brand_alias = resolve_product_header_alias(alias_source)
+
+        alias_key = normalize_product_header_key(alias_source)
         if (
             alias_key == "KIT"
             and current_block is not None
@@ -1087,9 +1554,10 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
         ):
             alias_key = "NERAKIT"
 
-        if alias_key in PRODUCT_HEADER_ALIASES:
-            catalog_headers = catalog_header_options(
-                PRODUCT_HEADER_ALIASES[alias_key]
+        if brand_alias:
+            catalog_headers = rank_brand_candidates(
+                line,
+                brand_alias,
             )
             current_block = {
                 "Mode": "direct",
@@ -1103,6 +1571,8 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
                     for catalog_header in catalog_headers
                 ],
                 "Entries": [],
+                "Requested Version": line_version or global_version,
+                "Version Policy": line_version_policy or global_version_policy,
             }
             blocks.append(current_block)
             continue
@@ -1114,6 +1584,8 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
                 "Family Options": PRODUCT_GROUP_ALIASES[alias_key],
                 "Families": [],
                 "Entries": [],
+                "Requested Version": line_version or global_version,
+                "Version Policy": line_version_policy or global_version_policy,
             }
             blocks.append(current_block)
             continue
@@ -1128,6 +1600,9 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
         if current_block is None:
             # Customer/warehouse notes and explicit SKU lines are handled by
             # other parsers and must not prevent later catalog blocks.
+            continue
+
+        if line_version and line_version_policy == "Only" and not stripped_version_line:
             continue
 
         if current_block["Mode"] == "group" and not current_block["Entries"]:
@@ -1152,11 +1627,16 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
                         })
                     continue
 
-        quantity, flavor_text = get_quantity_from_line(line)
+        entry_version = line_version
+        entry_version_policy = line_version_policy
+        flavor_source = stripped_version_line if entry_version and stripped_version_line else line
+        quantity, flavor_text = get_quantity_from_line(flavor_source)
         current_block["Entries"].append({
             "Input": line,
-            "Flavor": flavor_text if quantity is not None else line,
+            "Flavor": flavor_text if quantity is not None else flavor_source,
             "Explicit Quantity": quantity,
+            "Requested Version": entry_version,
+            "Version Policy": entry_version_policy,
         })
 
     usable_blocks = [
@@ -1204,6 +1684,12 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
                 if explicit_quantity is not None:
                     quantity = float(explicit_quantity)
                     quantity_reason = ""
+                elif default_quantity is not None:
+                    quantity = float(default_quantity)
+                    quantity_reason = (
+                        f"Global quantity instruction defaulted this line to "
+                        f"{quantity:g}"
+                    )
                 elif has_any_explicit_quantity:
                     quantity = 0.0
                     quantity_reason = "No quantity in mixed block; treated as 0"
@@ -1217,7 +1703,52 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
                 confidence = 0.0
                 exact_match = False
 
+                # In MT35000 orders, "Lemonade" in the flavor is itself an
+                # edition marker.  The customer may keep the block heading as
+                # plain MT35000, so check the related Lemonade Edition family
+                # for an exact flavor before attempting any fuzzy base-family
+                # match.  Keep regular and YN families separate.
+                block_headers = [
+                    str(family.get("Catalog Header", ""))
+                    for family in block["Families"]
+                ]
+                primary_header = block_headers[0] if block_headers else ""
+                is_plain_mt35 = (
+                    "LOST MARY" in primary_header.upper()
+                    and "MT35000" in primary_header.upper()
+                    and "LEMONADE EDITION" not in primary_header.upper()
+                )
+                if "LEMONADE" in normalize_word_text(entry["Flavor"]) and is_plain_mt35:
+                    wants_yn = " YN" in primary_header.upper()
+                    lemonade_header = (
+                        "LOST MARY (LEMONADE EDITION) YN_MT35000"
+                        if wants_yn
+                        else "LOST MARY (LEMONADE EDITION)_MT35000"
+                    )
+                    lemonade_df = catalog_df[
+                        (catalog_df["Brand Norm"] == normalize_match_text(lemonade_header))
+                        & (catalog_df["Prefix"] == "C")
+                    ].copy()
+                    if "Status" in lemonade_df.columns:
+                        active_lemonade = lemonade_df[
+                            lemonade_df["Status"].astype(str).str.lower().eq("active")
+                        ]
+                        if not active_lemonade.empty:
+                            lemonade_df = active_lemonade
+                    if not lemonade_df.empty:
+                        exact_lemonade = lemonade_df[
+                            lemonade_df["Flavor"].apply(normalize_flavor_key)
+                            == flavor_key
+                        ]
+                        if not exact_lemonade.empty:
+                            best_row = exact_lemonade.iloc[0]
+                            matched_header = lemonade_header
+                            confidence = 1.0
+                            exact_match = True
+
                 for catalog_header, family_df in family_options:
+                    if exact_match:
+                        break
                     if (
                         "WORLD CUP" in str(entry["Input"]).upper()
                         and "WORLD CUP" not in catalog_header.upper()
@@ -1254,7 +1785,10 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
                         confidence = fuzzy_confidence
 
                 suggested_sku = "" if best_row is None else str(best_row["SKU"])
-                duplicate_key = suggested_sku or flavor_key
+                # Different customer flavors can share the same fuzzy SKU
+                # suggestion.  Deduplicate by the entered flavor, otherwise a
+                # later unresolved demand line can disappear from review.
+                duplicate_key = flavor_key or suggested_sku
                 if duplicate_key in seen_family_flavors:
                     continue
                 seen_family_flavors.add(duplicate_key)
@@ -1286,6 +1820,16 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
                     "Confidence": round(confidence, 3),
                     "Need Review": need_review,
                     "Reason": "; ".join(reason_parts),
+                    "Requested Version": (
+                        entry.get("Requested Version")
+                        or block.get("Requested Version")
+                        or version_from_sku(suggested_sku)
+                    ),
+                    "Version Policy": (
+                        entry.get("Version Policy")
+                        or block.get("Version Policy")
+                        or "Preferred"
+                    ),
                 })
 
                 if exact_match and quantity > 0:
@@ -1385,6 +1929,16 @@ def parse_known_alias_flavor_blocks(raw_text, catalog_df, min_confidence=0.82):
                     "Confidence": round(confidence, 3),
                     "Need Review": need_review,
                     "Reason": "; ".join(reason_parts),
+                    "Requested Version": (
+                        entry.get("Requested Version")
+                        or block.get("Requested Version")
+                        or version_from_sku(suggested_sku)
+                    ),
+                    "Version Policy": (
+                        entry.get("Version Policy")
+                        or block.get("Version Policy")
+                        or "Preferred"
+                    ),
                 })
 
                 if exact_match and quantity > 0:
@@ -1488,7 +2042,9 @@ def parse_demand_with_product_catalog(raw_text, catalog_df, min_confidence=0.82)
     return extracted, review_rows
 
 
-def parse_demand_with_local_fallback(raw_text, catalog_df=None):
+def parse_demand_with_local_fallback(
+    raw_text, catalog_df=None, default_quantity=None
+):
     """Combine explicit SKUs, series requests, and known catalog blocks."""
     # Clipboard exports sometimes preserve HTML spaces as literal entities;
     # normalize once so every parser sees the same clean text.
@@ -1502,7 +2058,9 @@ def parse_demand_with_local_fallback(raw_text, catalog_df=None):
     catalog_review_rows = []
 
     if catalog_df is not None and not catalog_df.empty:
-        block_result = parse_known_alias_flavor_blocks(raw_text, catalog_df)
+        block_result = parse_known_alias_flavor_blocks(
+            raw_text, catalog_df, default_quantity=default_quantity
+        )
         if block_result is not None:
             block_rows, catalog_review_rows = block_result
             extracted.extend(block_rows)
@@ -1518,6 +2076,66 @@ def parse_demand_with_local_fallback(raw_text, catalog_df=None):
         return extracted, parser_name, catalog_review_rows
 
     return [], None, catalog_review_rows
+
+
+def infer_default_quantity_with_ai(raw_text, model):
+    """Interpret only a global quantity instruction; never extract or alter SKUs."""
+    api_key = get_openai_api_key()
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY is not configured.")
+    try:
+        from openai import OpenAI
+    except ImportError as exc:
+        raise RuntimeError(
+            "The openai package is not installed. Run: pip install openai"
+        ) from exc
+
+    client = OpenAI(api_key=api_key)
+    response = client.responses.create(
+        model=model.strip() or "gpt-4o-mini",
+        input=[
+            {
+                "role": "system",
+                "content": (
+                    "Find only an explicit global quantity instruction in order text. "
+                    "Never infer a default from product/model numbers or item quantities."
+                ),
+            },
+            {
+                "role": "user",
+                "content": f"""
+Return one JSON object with exactly these keys:
+- default_quantity: a positive number, or null
+- evidence: the exact source phrase supporting that default, or an empty string
+
+A valid instruction says that every item, each item, remaining items, or items
+without a written quantity should receive the same quantity. Examples include
+"1 case each", "all unmarked are 1", and "没标数字的全部为1".
+An item line such as "Blue Razz Ice 2" or product header such as "PULSE 2"
+is not a global instruction.
+
+Order text:
+{raw_text}
+""".strip(),
+            },
+        ],
+        temperature=0,
+    )
+    content = response.output_text.strip()
+    if content.startswith("```"):
+        content = re.sub(
+            r"^```(?:json)?\s*|\s*```$", "", content,
+            flags=re.IGNORECASE | re.DOTALL,
+        ).strip()
+    result = json.loads(content)
+    if not isinstance(result, dict):
+        return None
+    quantity = pd.to_numeric(result.get("default_quantity"), errors="coerce")
+    evidence = str(result.get("evidence", "") or "").strip()
+    source = str(raw_text or "")
+    if pd.isna(quantity) or float(quantity) <= 0 or not evidence or evidence not in source:
+        return None
+    return float(quantity)
 
 
 def parse_demand_with_ai(raw_text, model):
@@ -1952,7 +2570,11 @@ def build_recognition_audit(extracted_rows, review_rows, parser_used):
             "SKU": sku,
             "Quantity": float(quantity),
             "Match Method": (
-                "AI extraction" if parser_used == "ai" else "Explicit/local rule"
+                "AI quantity instruction"
+                if parser_used == "ai_quantity_instruction"
+                else "AI extraction"
+                if parser_used == "ai"
+                else "Explicit/local rule"
             ),
             "Confidence": 1.0,
             "Review Status": "Accepted",
@@ -2134,7 +2756,7 @@ def clear_pasted_demand():
     """
     widget_defaults = {
         "paste_order_details_input": "",
-        "paste_use_ai_input": False,
+        "paste_use_ai_input": bool(ai_enabled),
     }
     for key, value in widget_defaults.items():
         st.session_state[key] = value
@@ -2169,6 +2791,10 @@ original_sku_order = []  # 记录原始输入的 SKU 顺序
 product_catalog_df, product_catalog_error = load_product_catalog(
     str(DEFAULT_PRODUCT_CATALOG_PATH)
 )
+unmatched_alias_brands = find_unmatched_alias_brands(
+    PRODUCT_HEADER_ALIASES,
+    product_catalog_df,
+)
 
 if input_method == "Paste Text":
     st.caption(
@@ -2181,47 +2807,145 @@ if input_method == "Paste Text":
             f"Product Catalog loaded: {len(product_catalog_df)} SKU rows. "
             "Brand/flavor input will be matched locally before AI is needed."
         )
+    if PRODUCT_HEADER_ALIAS_ERROR:
+        st.warning(PRODUCT_HEADER_ALIAS_ERROR)
+    else:
+        st.caption(
+            f"Brand aliases loaded: {len(PRODUCT_HEADER_ALIASES)} normalized aliases "
+            f"from {DEFAULT_BRAND_ALIAS_PATH.name}."
+        )
+        if unmatched_alias_brands:
+            with st.expander(
+                f"Brand alias mapping needs review ({len(unmatched_alias_brands)} Brand values)"
+            ):
+                st.warning(
+                    "These Brand values do not exactly match Product Catalog.xlsx "
+                    "and will not produce catalog matches:"
+                )
+                st.code("\n".join(unmatched_alias_brands))
 
     st.caption("🖼️ You can also upload an order screenshot and extract its text first.")
-    order_image_file = st.file_uploader(
-        "Upload order screenshot",
+    order_image_files = st.file_uploader(
+        "Upload order screenshots (max 10 files)",
         type=["png", "jpg", "jpeg", "webp"],
+        accept_multiple_files=True,
         key="paste_order_image",
         help=(
-            "Image reading requires an OpenAI API key. Browser clipboard paste "
-            "is not available in the standard Streamlit uploader yet; upload or "
-            "drag the image here instead."
+            "Upload up to 10 pages from the same order. They are read and merged "
+            "in upload order. Image reading requires an OpenAI API key."
         ),
     )
-    if order_image_file is not None:
-        st.image(order_image_file, caption="Order screenshot", width=420)
+    unique_order_images, duplicate_image_names = deduplicate_uploaded_files(
+        order_image_files
+    )
+    too_many_order_images = len(order_image_files) > MAX_BATCH_UPLOADS
+    if too_many_order_images:
+        st.error(
+            f"Upload no more than {MAX_BATCH_UPLOADS} order images at a time. "
+            f"You selected {len(order_image_files)}."
+        )
+    if duplicate_image_names:
+        st.warning(
+            "Skipped identical duplicate image(s): "
+            + ", ".join(duplicate_image_names)
+        )
+
+    if unique_order_images and not too_many_order_images:
+        st.image(
+            [uploaded_file.getvalue() for uploaded_file in unique_order_images],
+            caption=[uploaded_file.name for uploaded_file in unique_order_images],
+            alt=[
+                f"Order page {index + 1}: {uploaded_file.name}"
+                for index, uploaded_file in enumerate(unique_order_images)
+            ],
+            width=240,
+        )
         if st.button(
-            "🖼️ Read Image Text",
+            "🖼️ Read / retry all image text",
             key="read_order_image_text",
             type="secondary",
             disabled=not ai_enabled,
         ):
-            try:
-                image_text = extract_order_text_from_image_with_ai(
-                    order_image_file.getvalue(),
-                    order_image_file.type or "image/png",
-                    os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                )
-                st.session_state["paste_order_details_input"] = image_text
-                st.session_state["paste_image_ocr_text"] = image_text
-                st.session_state["paste_image_ocr_error"] = ""
-            except Exception as exc:
-                st.session_state["paste_image_ocr_error"] = str(exc)
+            image_results = st.session_state.setdefault(
+                "paste_image_ocr_results", {}
+            )
+            for uploaded_file in unique_order_images:
+                fingerprint = uploaded_file_fingerprint(uploaded_file)
+                existing_result = image_results.get(fingerprint, {})
+                if existing_result.get("text"):
+                    continue
+                try:
+                    image_text = extract_order_text_from_image_with_ai(
+                        uploaded_file.getvalue(),
+                        uploaded_file.type or "image/png",
+                        os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                    )
+                    image_results[fingerprint] = {
+                        "name": uploaded_file.name,
+                        "text": image_text,
+                        "error": "",
+                    }
+                except Exception as exc:
+                    image_results[fingerprint] = {
+                        "name": uploaded_file.name,
+                        "text": "",
+                        "error": str(exc),
+                    }
 
-    image_ocr_error = st.session_state.get("paste_image_ocr_error", "")
-    if image_ocr_error:
-        st.error(f"Image text extraction failed: {image_ocr_error}")
-    elif st.session_state.get("paste_image_ocr_text"):
-        st.success(
-            "Image text extracted. Please review the text below before clicking "
-            "Start Matching."
+            combined_image_text = "\n\n".join(
+                image_results.get(
+                    uploaded_file_fingerprint(uploaded_file), {}
+                ).get("text", "")
+                for uploaded_file in unique_order_images
+                if image_results.get(
+                    uploaded_file_fingerprint(uploaded_file), {}
+                ).get("text", "")
+            )
+            if combined_image_text:
+                st.session_state["paste_order_details_input"] = combined_image_text
+                st.session_state["paste_image_ocr_text"] = combined_image_text
+
+        image_results = st.session_state.get("paste_image_ocr_results", {})
+        image_status_rows = []
+        for index, uploaded_file in enumerate(unique_order_images, start=1):
+            result = image_results.get(
+                uploaded_file_fingerprint(uploaded_file), {}
+            )
+            status = "Not read"
+            detail = ""
+            if result.get("text"):
+                status = "Ready"
+            elif result.get("error"):
+                status = "Failed"
+                detail = result["error"]
+            image_status_rows.append(
+                {
+                    "Page": index,
+                    "File": uploaded_file.name,
+                    "Status": status,
+                    "Detail": detail,
+                }
+            )
+        st.dataframe(pd.DataFrame(image_status_rows), hide_index=True)
+
+        failed_image_count = sum(
+            1 for row in image_status_rows if row["Status"] == "Failed"
         )
+        ready_image_count = sum(
+            1 for row in image_status_rows if row["Status"] == "Ready"
+        )
+        if failed_image_count:
+            st.error(
+                f"{failed_image_count} image(s) failed. Fix the issue and click "
+                "Read / retry all image text again; successful pages will not be reread."
+            )
+        elif ready_image_count == len(unique_order_images):
+            st.success(
+                f"All {ready_image_count} image page(s) were merged in upload order. "
+                "Review the text below before clicking Start Matching."
+            )
 
+    st.session_state.setdefault("paste_use_ai_input", bool(ai_enabled))
     with st.form("paste_order_matching_form", clear_on_submit=False):
         raw_text_input = st.text_area(
             "Paste Order Details",
@@ -2236,7 +2960,6 @@ if input_method == "Paste Text":
         )
         use_ai_input = st.checkbox(
             "Use AI extraction for pasted text",
-            value=False,
             key="paste_use_ai_input",
             disabled=not ai_enabled,
             help=(
@@ -2280,12 +3003,33 @@ if input_method == "Paste Text":
         st.session_state["paste_catalog_review_rows"] = []
         st.session_state.pop("paste_text_demand_editor", None)
         st.session_state.pop("paste_catalog_match_editor", None)
+        st.session_state["paste_history_record_id"] = ""
+        st.session_state["paste_history_error"] = ""
+        if raw_text_input.strip():
+            try:
+                history_record, history_path = record_order_detail(
+                    raw_text_input,
+                    use_ai=bool(use_ai_input),
+                )
+                st.session_state["paste_history_record_id"] = history_record[
+                    "record_id"
+                ]
+                st.session_state["paste_history_path"] = str(history_path)
+            except Exception as exc:
+                st.session_state["paste_history_error"] = str(exc)
 
     raw_text = st.session_state.get("submitted_paste_text", "")
     use_ai_extraction = st.session_state.get("submitted_use_ai", False)
 
     if start_matching and not raw_text.strip():
         st.warning("Paste order details before starting the match.")
+    elif start_matching:
+        history_error = st.session_state.get("paste_history_error", "")
+        if history_error:
+            st.error(f"Order history could not be saved: {history_error}")
+        else:
+            record_id = st.session_state.get("paste_history_record_id", "")
+            st.success(f"Order detail recorded. Record ID: {record_id[:12]}")
 
     if raw_text:
         demand_parse_text, paste_repeat_count = collapse_repeated_paste(raw_text)
@@ -2326,8 +3070,27 @@ if input_method == "Paste Text":
                         if bool(row.get("Need Review", False))
                     ]
 
-                    if unresolved_rows:
-                        parser_used = local_parser
+                    missing_quantity_rows = [
+                        row for row in unresolved_rows
+                        if float(row.get("Quantity", 0) or 0) <= 0
+                    ]
+                    if missing_quantity_rows:
+                        ai_default_quantity = infer_default_quantity_with_ai(
+                            demand_parse_text, ai_model
+                        )
+                        if ai_default_quantity is not None:
+                            local_rows, local_parser, local_review = (
+                                parse_demand_with_local_fallback(
+                                    demand_parse_text,
+                                    product_catalog_df,
+                                    default_quantity=ai_default_quantity,
+                                )
+                            )
+                            extracted = list(local_rows)
+                            catalog_review_rows = list(local_review)
+                            parser_used = "ai_quantity_instruction"
+                        else:
+                            parser_used = local_parser
                     else:
                         parser_used = local_parser
 
@@ -2638,10 +3401,17 @@ if input_method == "Paste Text":
                         "confirmation before they will be added."
                     )
 
+            extracted = enrich_demand_version_preferences(
+                extracted,
+                catalog_review_rows,
+                demand_parse_text,
+            )
             parser_extracted_rows = [dict(row) for row in extracted]
             df_demand = pd.DataFrame(extracted)
             if parser_used == "ai":
                 extraction_label = "AI"
+            elif parser_used == "ai_quantity_instruction":
+                extraction_label = "local matching + AI quantity instruction"
             elif parser_used == "hybrid":
                 extraction_label = "AI + local rules"
             elif parser_used == "product_catalog":
@@ -2656,8 +3426,43 @@ if input_method == "Paste Text":
                 df_demand,
                 num_rows="dynamic",
                 use_container_width=True,
+                column_config={
+                    "Requested Version": st.column_config.SelectboxColumn(
+                        "Requested Version",
+                        options=["Regular", "YN", "MG", "YN/MG", "0MG", "YN 0MG"],
+                    ),
+                    "Version Policy": st.column_config.SelectboxColumn(
+                        "Version Policy",
+                        options=["Preferred", "Only"],
+                    ),
+                },
                 key="paste_text_demand_editor"
             )
+
+            history_record_id = st.session_state.get(
+                "paste_history_record_id", ""
+            )
+            if st.button(
+                "Save confirmed result as correct answer",
+                type="primary",
+                disabled=not bool(history_record_id),
+                key="save_paste_correct_answer",
+            ):
+                try:
+                    answer_record, answer_path = record_order_answer(
+                        history_record_id,
+                        df_demand.to_dict("records"),
+                    )
+                    st.session_state["paste_answer_record_id"] = answer_record[
+                        "answer_id"
+                    ]
+                    st.session_state["paste_answer_path"] = str(answer_path)
+                    st.success(
+                        "Correct answer saved and linked to this order sample. "
+                        f"Answer ID: {answer_record['answer_id'][:12]}"
+                    )
+                except Exception as exc:
+                    st.error(f"Correct answer could not be saved: {exc}")
 
             recognition_audit = build_recognition_audit(
                 parser_extracted_rows,
@@ -2763,11 +3568,13 @@ if allocation_plan.startswith("Plan C"):
 def get_sku_detail(sku):
     sku = str(sku).strip().upper() if pd.notnull(sku) else ""
 
-    if enable_variant_match:
-        for idx, v in enumerate(variant_prefixes, start=1):
-            for p in ["C-", "B-"]:
-                if sku.startswith(p + v):
-                    return p + sku[len(p) + len(v):], idx, sku
+    # Always normalize the version family. The sidebar option controls whether
+    # fallback versions may be allocated; it must not erase an explicitly
+    # requested YN/MG identity during inventory preparation.
+    for v, idx in [("YN0MG", 4), ("0MG", 3), ("YN", 1), ("MG", 2)]:
+        for p in ["C-", "B-"]:
+            if sku.startswith(p + v):
+                return p + sku[len(p) + len(v):], idx, sku
 
     return sku, 0, sku
 
@@ -2847,7 +3654,8 @@ def expand_all_in_stock_series_requests(
     catalog_df,
     inventory_df,
     inventory_qty_col,
-    warehouse_tags
+    warehouse_tags,
+    allow_subhalf=False,
 ):
     """Expand series requests into base SKUs with stock in target warehouses."""
     expanded_rows = []
@@ -2866,7 +3674,7 @@ def expand_all_in_stock_series_requests(
             target_inventory
             .groupby(["Match_SKU", "Clean_SKU"])[inventory_qty_col]
             .sum()
-            .apply(floor_to_shipment_increment)
+            .apply(lambda value: allocatable_quantity(value, allow_subhalf))
         )
         stock_by_match_sku = stock_by_actual_sku.groupby(level=0).sum()
     else:
@@ -2895,8 +3703,9 @@ def expand_all_in_stock_series_requests(
         if series_rows.empty:
             reason = "No matching product series found in Product Catalog"
         elif not in_stock_skus:
+            minimum_text = "positive" if allow_subhalf else "at least 0.5"
             reason = (
-                "No matching C- flavor has at least 0.5 allocatable stock "
+                f"No matching C- flavor has {minimum_text} allocatable stock "
                 "in TX/PHX/ID/IL"
             )
         else:
@@ -3121,6 +3930,8 @@ def build_order_template(
 
     base_shortage_columns = [
         "SKU",
+        "Requested Version",
+        "Version Policy",
         "Demand Quantity",
         "Allocated Quantity",
         "Unfulfilled Quantity",
@@ -3203,40 +4014,239 @@ def build_order_template(
     return output.getvalue()
 
 
+def build_order_csv(
+    guide_df,
+    template_path=DEFAULT_TEMPLATE_PATH,
+):
+    """Build a formula-free CSV matching the order template's SUMMARY columns."""
+    if guide_df is None or guide_df.empty:
+        raise ValueError("No allocation result is available for CSV export.")
+
+    template_path = Path(template_path)
+    if not template_path.exists():
+        raise FileNotFoundError(f"Order template was not found: {template_path}")
+
+    export_df = guide_df[["Warehouse", "Order SKU", "Quantity"]].copy()
+    export_df["Warehouse"] = export_df["Warehouse"].astype(str).str.strip()
+    export_df["Order SKU"] = export_df["Order SKU"].astype(str).str.strip()
+    export_df["Quantity"] = pd.to_numeric(
+        export_df["Quantity"], errors="coerce"
+    ).fillna(0)
+    export_df = export_df[
+        (export_df["Warehouse"] != "")
+        & (export_df["Order SKU"] != "")
+        & (export_df["Quantity"] > 0)
+    ].reset_index(drop=True)
+    if export_df.empty:
+        raise ValueError("No positive allocation rows are available for CSV export.")
+
+    workbook = load_workbook(template_path, read_only=True, data_only=False)
+    try:
+        if "SUMMARY" not in workbook.sheetnames:
+            raise ValueError("The order template does not contain a SUMMARY sheet.")
+        if "Product Code" not in workbook.sheetnames:
+            raise ValueError("The order template does not contain a Product Code sheet.")
+
+        summary_ws = workbook["SUMMARY"]
+        headers = [summary_ws.cell(1, column).value for column in range(1, 14)]
+        defaults = [summary_ws.cell(2, column).value for column in range(1, 14)]
+
+        product_code_ws = workbook["Product Code"]
+        product_codes = {}
+        for row in product_code_ws.iter_rows(min_row=2, min_col=1, max_col=4, values_only=True):
+            sku = str(row[0] or "").strip()
+            product_code = str(row[3] or "").strip()
+            if sku and sku not in product_codes:
+                product_codes[sku] = product_code
+    finally:
+        workbook.close()
+
+    missing_product_codes = sorted(
+        {
+            sku
+            for sku in export_df["Order SKU"]
+            if not product_codes.get(sku, "")
+        }
+    )
+    if missing_product_codes:
+        preview = ", ".join(missing_product_codes[:10])
+        extra = "" if len(missing_product_codes) <= 10 else " ..."
+        raise ValueError(
+            f"Product Code is missing for {len(missing_product_codes)} SKU(s): "
+            f"{preview}{extra}"
+        )
+
+    base_sales_order = defaults[1]
+    warehouse_order_numbers = {}
+    for warehouse in export_df["Warehouse"]:
+        if warehouse not in warehouse_order_numbers:
+            warehouse_order_numbers[warehouse] = increment_sales_order_number(
+                base_sales_order,
+                len(warehouse_order_numbers),
+            )
+
+    order_date = datetime.now().strftime("%m/%d/%Y")
+    rows = []
+    for _, record in export_df.iterrows():
+        warehouse = record["Warehouse"]
+        sku = record["Order SKU"]
+        quantity = float(record["Quantity"])
+        rows.append({
+            headers[0]: order_date,
+            headers[1]: warehouse_order_numbers[warehouse],
+            headers[2]: defaults[2],
+            headers[3]: defaults[3],
+            headers[4]: defaults[4],
+            headers[5]: warehouse,
+            headers[6]: defaults[6],
+            headers[7]: defaults[7],
+            headers[8]: defaults[8],
+            headers[9]: defaults[9],
+            headers[10]: product_codes[sku],
+            headers[11]: sku,
+            headers[12]: int(quantity) if quantity.is_integer() else quantity,
+        })
+
+    csv_text = pd.DataFrame(rows, columns=headers).to_csv(index=False, lineterminator="\n")
+    return csv_text.encode("utf-8-sig")
+
+
 # --- 3. Allocation Logic ---
 if allocation_plan.startswith("Plan C"):
-    inv_f = None
+    inv_files = []
 else:
     st.divider()
-    inv_f = st.file_uploader(
-        "Upload Inventory File (Kingdee)",
+    inv_files = st.file_uploader(
+        "Upload Inventory Files (max 10 files)",
         type=["xlsx", "csv"],
+        accept_multiple_files=True,
+        help=(
+            "Upload up to 10 inventory files. Files are merged only when the same "
+            "Warehouse + SKU does not appear across different files."
+        ),
     )
 
-if inv_f and not df_demand.empty:
+if inv_files and not df_demand.empty:
     try:
-        # --- Load Inventory File ---
-        df_inv = pd.read_csv(inv_f) if inv_f.name.endswith(".csv") else pd.read_excel(inv_f)
-        df_inv.columns = [str(c).strip() for c in df_inv.columns]
+        if len(inv_files) > MAX_BATCH_UPLOADS:
+            st.error(
+                f"Upload no more than {MAX_BATCH_UPLOADS} inventory files at a time. "
+                f"You selected {len(inv_files)}."
+            )
+            st.stop()
+
+        unique_inventory_files, duplicate_inventory_names = (
+            deduplicate_uploaded_files(inv_files)
+        )
+        if duplicate_inventory_names:
+            st.warning(
+                "Skipped identical duplicate inventory file(s): "
+                + ", ".join(duplicate_inventory_names)
+            )
+
+        inventory_frames = []
+        inventory_file_status = []
+        for inventory_file in unique_inventory_files:
+            try:
+                inventory_frame = read_inventory_upload(inventory_file)
+                inventory_frames.append(inventory_frame)
+                inventory_file_status.append(
+                    {
+                        "File": inventory_file.name,
+                        "Rows": len(inventory_frame),
+                        "Status": "Ready",
+                        "Detail": "",
+                    }
+                )
+            except Exception as exc:
+                inventory_file_status.append(
+                    {
+                        "File": inventory_file.name,
+                        "Rows": 0,
+                        "Status": "Failed",
+                        "Detail": str(exc),
+                    }
+                )
+
+        st.dataframe(pd.DataFrame(inventory_file_status), hide_index=True)
+        failed_inventory_files = [
+            row for row in inventory_file_status if row["Status"] == "Failed"
+        ]
+        if failed_inventory_files:
+            st.error(
+                "One or more inventory files could not be read. Remove or correct "
+                "the failed file(s) before allocation."
+            )
+            st.stop()
+
+        shared_columns = common_inventory_columns(inventory_frames)
+        if not shared_columns:
+            st.error(
+                "The inventory files do not share any column names. Use files with "
+                "compatible warehouse, SKU, and inventory fields."
+            )
+            st.stop()
+
+        df_inv = pd.concat(inventory_frames, ignore_index=True, sort=False)
 
         # --- 需求 1：智能/手动列名映射 ---
         st.subheader("🔍 Inventory Column Mapping")
         
         # 尝试自动寻找默认列名
-        default_wh_col = "Warehouse Name" if "Warehouse Name" in df_inv.columns else df_inv.columns[0]
-        default_sku_col = "SKU" if "SKU" in df_inv.columns else df_inv.columns[0]
+        default_wh_col = "Warehouse Name" if "Warehouse Name" in shared_columns else shared_columns[0]
+        default_sku_col = "SKU" if "SKU" in shared_columns else shared_columns[0]
         
-        if "Available For Sale" in df_inv.columns:
+        if "Available For Sale" in shared_columns:
             default_qty_col = "Available For Sale"
-        elif "Accounting Available For Sale" in df_inv.columns:
+        elif "Accounting Available For Sale" in shared_columns:
             default_qty_col = "Accounting Available For Sale"
         else:
-            default_qty_col = df_inv.columns[0]
+            default_qty_col = shared_columns[0]
 
         # 创建三个可选的映射项（让用户在表格格式改变时可以手动选）
-        col_wh = st.selectbox("Warehouse Column:", df_inv.columns, index=list(df_inv.columns).index(default_wh_col))
-        col_sku = st.selectbox("SKU Column:", df_inv.columns, index=list(df_inv.columns).index(default_sku_col))
-        col_qty = st.selectbox("Inventory Quantity Column:", df_inv.columns, index=list(df_inv.columns).index(default_qty_col))
+        col_wh = st.selectbox("Warehouse Column:", shared_columns, index=shared_columns.index(default_wh_col))
+        col_sku = st.selectbox("SKU Column:", shared_columns, index=shared_columns.index(default_sku_col))
+        col_qty = st.selectbox("Inventory Quantity Column:", shared_columns, index=shared_columns.index(default_qty_col))
+
+        df_inv, ignored_warehouse_names = filter_inventory_warehouses(
+            df_inv,
+            col_wh,
+            include_storage=include_storage_warehouses,
+        )
+        included_warehouse_names = sorted(
+            df_inv[col_wh].astype(str).str.strip().unique()
+        )
+        if not included_warehouse_names:
+            st.error(
+                "No eligible inventory warehouses remain. Standard _SALE "
+                "warehouses are used by default; enable storage warehouses to "
+                "also use standard _STORAGE warehouses."
+            )
+            st.stop()
+
+        st.caption(
+            "Warehouses used: " + ", ".join(included_warehouse_names)
+        )
+        if ignored_warehouse_names:
+            with st.expander(
+                f"Ignored warehouses ({len(ignored_warehouse_names)})"
+            ):
+                st.code("\n".join(ignored_warehouse_names))
+
+        inventory_conflicts = find_cross_file_inventory_conflicts(
+            df_inv,
+            col_wh,
+            col_sku,
+            col_qty,
+        )
+        if not inventory_conflicts.empty:
+            st.error(
+                "Inventory conflict detected: the same Warehouse + SKU appears in "
+                "more than one uploaded file. Allocation is paused until the "
+                "overlapping file is removed or corrected."
+            )
+            st.dataframe(inventory_conflicts, hide_index=True)
+            st.stop()
 
         # 统一重命名，确保不破坏后面所有的处理逻辑流程
         df_inv = df_inv.rename(columns={
@@ -3295,7 +4305,8 @@ if inv_f and not df_demand.empty:
                     product_catalog_df,
                     df_inv,
                     col,
-                    default_order
+                    default_order,
+                    allow_subhalf_case,
                 )
             )
             st.subheader("🧠 Inventory-dependent Series Expansion")
@@ -3326,16 +4337,45 @@ if inv_f and not df_demand.empty:
             )
             st.stop()
 
+        if "Requested Version" not in df_demand.columns:
+            df_demand["Requested Version"] = df_demand["SKU"].apply(version_from_sku)
+        else:
+            valid_versions = {"Regular", "YN", "MG", "YN/MG", "0MG", "YN 0MG"}
+            df_demand["Requested Version"] = df_demand.apply(
+                lambda row: (
+                    str(row.get("Requested Version", "")).strip()
+                    if str(row.get("Requested Version", "")).strip() in valid_versions
+                    else version_from_sku(row.get("SKU", ""))
+                ),
+                axis=1,
+            )
+        if "Version Policy" not in df_demand.columns:
+            df_demand["Version Policy"] = "Preferred"
+        df_demand["Version Policy"] = df_demand["Version Policy"].apply(
+            lambda value: "Only" if str(value).strip().lower() == "only" else "Preferred"
+        )
+        df_demand["Match_SKU"] = df_demand["SKU"].apply(
+            lambda sku: get_sku_detail(sku)[0]
+        )
+        df_demand["Original Demand SKU"] = df_demand["SKU"].astype(str)
+
         # 重新捕获最新最准的输入顺序
         original_sku_order = list(df_demand["SKU"].unique())
 
-        # 建立 原始需求 SKU -> 标准 SKU 的映射字典，用于后面追溯原始需求
-        sku_to_match_dict = {s: get_sku_detail(s)[0] for s in original_sku_order}
-
         # --- Standardize Demand SKU ---
-        demand_grouped = df_demand.groupby(
-            df_demand.apply(lambda r: get_sku_detail(r["SKU"])[0], axis=1)
-        )["Quantity"].sum().to_dict()
+        demand_grouped = (
+            df_demand.groupby(
+                [
+                    "Match_SKU",
+                    "Requested Version",
+                    "Version Policy",
+                    "Original Demand SKU",
+                ],
+                sort=False,
+            )["Quantity"]
+            .sum()
+            .to_dict()
+        )
 
         # --- Core Allocation Logic ---
         def run_allocation(rem_demand, wh_list):
@@ -3343,108 +4383,158 @@ if inv_f and not df_demand.empty:
             logic = []
             rem = rem_demand.copy()
 
-            for wh_tag in wh_list:
-                wh_names = [
-                    n for n in df_inv["Warehouse Name"].unique()
-                    if str(wh_tag).upper() in str(n).upper()
-                ]
+            warehouse_sequence = build_warehouse_sequence(
+                df_inv["Warehouse Name"].unique(),
+                wh_list,
+                include_storage=include_storage_warehouses,
+            )
 
-                for wh in wh_names:
+            for demand_key in list(rem.keys()):
+                if rem[demand_key] <= 0:
+                    continue
+                m_sku, requested_version, version_policy, orig_sku_label = demand_key
+                allowed_versions = version_priority_order(
+                    requested_version,
+                    version_policy,
+                    allow_alternatives=enable_variant_match,
+                )
+                allocation_priority = {
+                    version_code: index
+                    for index, version_code in enumerate(allowed_versions)
+                }
+
+                warehouse_options = []
+                for priority_index, wh in enumerate(warehouse_sequence):
                     wh_stock = df_inv[df_inv["Warehouse Name"] == wh].copy()
+                    availability_by_sku = (
+                        wh_stock[
+                            (wh_stock["Match_SKU"] == m_sku)
+                            & (wh_stock["Ver_Priority"].isin(allowed_versions))
+                        ]
+                        .groupby("Clean_SKU")[col]
+                        .sum()
+                    )
+                    available = float(
+                        availability_by_sku.apply(
+                            lambda value: allocatable_quantity(
+                                value,
+                                allow_subhalf_case,
+                            )
+                        ).sum()
+                    )
+                    warehouse_options.append({
+                        "Warehouse": wh,
+                        "Available": available,
+                        "Priority": priority_index,
+                        "Group": warehouse_region(wh),
+                    })
 
-                    if wh_stock.empty:
+                sku_warehouse_sequence = prioritize_fulfillment_warehouses(
+                    rem[demand_key],
+                    warehouse_options,
+                    allow_subhalf_case,
+                )
+
+                for wh in sku_warehouse_sequence:
+                    if rem[demand_key] <= 1e-9:
+                        break
+
+                    wh_stock = df_inv[df_inv["Warehouse Name"] == wh].copy()
+                    sku_options = (
+                        wh_stock[
+                            (wh_stock["Match_SKU"] == m_sku)
+                            & (wh_stock["Ver_Priority"].isin(allowed_versions))
+                        ]
+                        .groupby(
+                            ["Clean_SKU", "Ver_Priority"],
+                            as_index=False,
+                            sort=False
+                        )[col]
+                        .sum()
+                    )
+                    sku_options["Allocation Priority"] = sku_options[
+                        "Ver_Priority"
+                    ].map(allocation_priority)
+                    sku_options = sku_options.sort_values(
+                        by="Allocation Priority", kind="stable"
+                    )
+                    sku_options[allocation_col] = sku_options[col].apply(
+                        lambda value: allocatable_quantity(
+                            value,
+                            allow_subhalf_case,
+                        )
+                    )
+                    minimum_mask = (
+                        sku_options[allocation_col] > 1e-9
+                        if allow_subhalf_case
+                        else sku_options[allocation_col] >= SHIPMENT_INCREMENT
+                    )
+                    sku_options = sku_options[minimum_mask]
+
+                    if sku_options.empty:
                         continue
 
-                    for m_sku in list(rem.keys()):
-                        if rem[m_sku] <= 0:
-                            continue
+                    regular_options = sku_options[
+                        sku_options["Ver_Priority"] == 0
+                    ]
+                    variant_options = sku_options[
+                        sku_options["Ver_Priority"].isin([1, 2, 3, 4])
+                    ]
+                    n_avail = float(regular_options[allocation_col].sum())
+                    n_name = "/".join(
+                        regular_options["Clean_SKU"].astype(str).unique()
+                    )
+                    v_avail = float(variant_options[allocation_col].sum())
+                    v_name = "/".join(
+                        variant_options["Clean_SKU"].astype(str).unique()
+                    )
 
-                        sku_options = (
-                            wh_stock[wh_stock["Match_SKU"] == m_sku]
-                            .groupby(
-                                ["Clean_SKU", "Ver_Priority"],
-                                as_index=False,
-                                sort=False
-                            )[col]
-                            .sum()
-                            .sort_values(by="Ver_Priority", kind="stable")
-                        )
-                        sku_options[allocation_col] = sku_options[col].apply(
-                            floor_to_shipment_increment
-                        )
-                        sku_options = sku_options[
-                            sku_options[allocation_col] >= SHIPMENT_INCREMENT
-                        ]
+                    shipment_options = [
+                        {
+                            "SKU": row["Clean_SKU"],
+                            "Priority": row["Allocation Priority"],
+                            "Available": row[allocation_col],
+                        }
+                        for _, row in sku_options.iterrows()
+                    ]
+                    allocations = choose_variant_shipments(
+                        rem[demand_key],
+                        shipment_options,
+                        allow_subhalf_case,
+                    )
+                    allocated_total = sum(
+                        allocation["Quantity"]
+                        for allocation in allocations
+                    )
 
-                        if sku_options.empty:
-                            continue
+                    minimum_allocation = 1e-9 if allow_subhalf_case else SHIPMENT_INCREMENT
+                    if allocated_total + 1e-9 >= minimum_allocation:
+                        logic.append({
+                            "Standard SKU": str(m_sku),
+                            "Requested Version": requested_version,
+                            "Version Policy": version_policy,
+                            "Allocated Warehouse": str(wh),
+                            "Allocated Qty": float(allocated_total),
+                            "Regular Version Reference":
+                                f"{n_name} (Remain:{n_avail})" if n_avail > 0 else "-",
+                            "YN/MG Version Reference":
+                                f"{v_name} (Remain:{v_avail})" if v_avail > 0 else "-"
+                        })
 
-                        regular_options = sku_options[
-                            sku_options["Ver_Priority"] == 0
-                        ]
-                        variant_options = sku_options[
-                            sku_options["Ver_Priority"].isin([1, 2])
-                        ]
-                        n_avail = float(regular_options[allocation_col].sum())
-                        n_name = "/".join(
-                            regular_options["Clean_SKU"].astype(str).unique()
-                        )
-                        v_avail = float(variant_options[allocation_col].sum())
-                        v_name = "/".join(
-                            variant_options["Clean_SKU"].astype(str).unique()
-                        )
-
-                        shipment_options = [
-                            {
-                                "SKU": row["Clean_SKU"],
-                                "Priority": row["Ver_Priority"],
-                                "Available": row[allocation_col],
-                            }
-                            for _, row in sku_options.iterrows()
-                        ]
-                        allocations = choose_variant_shipments(
-                            rem[m_sku],
-                            shipment_options
-                        )
-                        allocated_total = sum(
-                            allocation["Quantity"]
-                            for allocation in allocations
-                        )
-
-                        if allocated_total >= SHIPMENT_INCREMENT:
-                            logic.append({
-                                "Standard SKU": str(m_sku),
-                                "Allocated Warehouse": str(wh),
-                                "Allocated Qty": float(allocated_total),
-                                "Regular Version Reference":
-                                    f"{n_name} (Remain:{n_avail})" if n_avail > 0 else "-",
-                                "YN/MG Version Reference":
-                                    f"{v_name} (Remain:{v_avail})" if v_avail > 0 else "-"
+                        for allocation in allocations:
+                            guide.append({
+                                "Warehouse": str(wh),
+                                "Original Demand SKU": orig_sku_label,
+                                "Requested Version": requested_version,
+                                "Version Policy": version_policy,
+                                "Order SKU": str(allocation["SKU"]),
+                                "Quantity": float(allocation["Quantity"])
                             })
 
-                            for allocation in allocations:
-                                # 尝试找回原始需求对应的SKU全称，用于排序和比对高亮
-                                orig_sku_matches = [
-                                    orig for orig, match in sku_to_match_dict.items()
-                                    if match == m_sku
-                                ]
-                                orig_sku_label = (
-                                    orig_sku_matches[0]
-                                    if orig_sku_matches
-                                    else str(m_sku)
-                                )
-
-                                guide.append({
-                                    "Warehouse": str(wh),
-                                    "Original Demand SKU": orig_sku_label,
-                                    "Order SKU": str(allocation["SKU"]),
-                                    "Quantity": float(allocation["Quantity"])
-                                })
-
-                            rem[m_sku] = max(
-                                round(rem[m_sku] - allocated_total, 10),
-                                0.0
-                            )
+                        rem[demand_key] = max(
+                            round(rem[demand_key] - allocated_total, 10),
+                            0.0
+                        )
 
             return pd.DataFrame(guide), pd.DataFrame(logic), rem
 
@@ -3457,25 +4547,57 @@ if inv_f and not df_demand.empty:
             selected_plan_code = "B"
             selected_plan_title = "Plan B: Logistics-Optimized Allocation"
             wh_scores = []
+            available_regions = []
             for wh in df_inv["Warehouse Name"].unique():
+                region = warehouse_region(wh)
+                if region and region not in available_regions:
+                    available_regions.append(region)
+
+            for region in available_regions:
                 score = 0
-                wh_inventory = df_inv[df_inv["Warehouse Name"] == wh]
+                wh_inventory = df_inv[
+                    df_inv["Warehouse Name"].apply(warehouse_region) == region
+                ]
                 wh_inv_by_actual_sku = (
                     wh_inventory
                     .groupby(["Match_SKU", "Clean_SKU"])[col]
                     .sum()
-                    .apply(floor_to_shipment_increment)
+                    .apply(
+                        lambda value: allocatable_quantity(
+                            value,
+                            allow_subhalf_case,
+                        )
+                    )
                 )
                 wh_inv_part = wh_inv_by_actual_sku.groupby(level=0).sum()
 
-                for s, q in demand_grouped.items():
-                    available = wh_inv_part.get(s, 0)
+                for demand_key, q in demand_grouped.items():
+                    s, requested_version, version_policy, _ = demand_key
+                    allowed_versions = version_priority_order(
+                        requested_version,
+                        version_policy,
+                        allow_alternatives=enable_variant_match,
+                    )
+                    allowed_inventory = wh_inventory[
+                        wh_inventory["Ver_Priority"].isin(allowed_versions)
+                    ]
+                    available = float(
+                        allowed_inventory.loc[
+                            allowed_inventory["Match_SKU"] == s,
+                            col,
+                        ].apply(
+                            lambda value: allocatable_quantity(
+                                value,
+                                allow_subhalf_case,
+                            )
+                        ).sum()
+                    )
                     if available >= q:
                         score += 10
                     elif available > 0:
                         score += 1
 
-                wh_scores.append({"name": wh, "score": score})
+                wh_scores.append({"name": region, "score": score})
 
             selected_priority = [
                 x["name"]
@@ -3502,7 +4624,14 @@ if inv_f and not df_demand.empty:
         # --- Display Results ---
         st.subheader(selected_plan_title)
         if not df_guide_selected.empty:
-            show_cols = ["Warehouse", "Original Demand SKU", "Order SKU", "Quantity"]
+            show_cols = [
+                "Warehouse",
+                "Original Demand SKU",
+                "Requested Version",
+                "Version Policy",
+                "Order SKU",
+                "Quantity",
+            ]
             df_disp_selected = safe_display_df(df_guide_selected[show_cols])
             st.dataframe(
                 style_variant_rows(df_disp_selected),
@@ -3522,11 +4651,14 @@ if inv_f and not df_demand.empty:
         st.subheader("📥 Export & Shortage Report")
 
         shortage_data = []
-        for k, v in rem_selected.items():
+        for demand_key, v in rem_selected.items():
             if v > 0:
-                demand_quantity = float(demand_grouped.get(k, v))
+                k, requested_version, version_policy, original_demand_sku = demand_key
+                demand_quantity = float(demand_grouped.get(demand_key, v))
                 record = {
-                    "SKU": str(k),
+                    "SKU": str(original_demand_sku),
+                    "Requested Version": requested_version,
+                    "Version Policy": version_policy,
                     "Demand Quantity": demand_quantity,
                     "Allocated Quantity": max(demand_quantity - float(v), 0.0),
                     "Unfulfilled Quantity": float(v)
@@ -3536,7 +4668,8 @@ if inv_f and not df_demand.empty:
                     k,
                     df_inv,
                     df_guide_selected,
-                    col
+                    col,
+                    allow_subhalf_case,
                 )
                 record["Sub-0.5 Stock Total"] = float(
                     subincrement_details["Sub-0.5 Remainder"].sum()
@@ -3565,26 +4698,48 @@ if inv_f and not df_demand.empty:
                         target_b_sku = f"B-{suffix}"
                     
                     if target_b_sku:
-                        # 筛选出原始库存表中目标 B- SKU 的数据
+                        box_versions = version_priority_order(
+                            requested_version,
+                            version_policy,
+                            allow_alternatives=True,
+                        )
                         b_stock_df = df_inv[
-                            (df_inv["SKU"].str.upper() == target_b_sku) | 
                             (df_inv["Match_SKU"].str.upper() == target_b_sku)
-                        ]
-                        
-                        record["Alternative B- SKU"] = target_b_sku
+                            & (df_inv["Ver_Priority"].isin(box_versions))
+                        ].copy()
+                        version_labels = {
+                            0: "Regular",
+                            1: "YN",
+                            2: "MG",
+                            3: "0MG",
+                            4: "YN 0MG",
+                        }
+                        b_stock_df["Version"] = b_stock_df["Ver_Priority"].map(
+                            version_labels
+                        )
+
+                        actual_b_skus = b_stock_df["Clean_SKU"].dropna().astype(str).unique()
+                        record["Alternative B- SKU"] = (
+                            ", ".join(actual_b_skus) if len(actual_b_skus) else target_b_sku
+                        )
                         
                         if not b_stock_df.empty:
                             # 按仓库分组求和
-                            wh_breakdown = b_stock_df.groupby("Warehouse Name")[col].sum()
-                            # 过滤掉库存小于等于0的仓库
+                            wh_breakdown = b_stock_df.groupby(
+                                ["Clean_SKU", "Version", "Warehouse Name"],
+                                sort=False,
+                            )[col].sum()
                             wh_breakdown = wh_breakdown[wh_breakdown > 0]
                             
                             total_b_stock = wh_breakdown.sum()
                             record["Total B- Inventory (Box)"] = float(total_b_stock)
                             
                             if total_b_stock > 0:
-                                # 生成类似 "TX: 50, PHX: 20" 的格式化字符串
-                                breakdown_str = ", ".join([f"{wh}: {int(qty)}" for wh, qty in wh_breakdown.items()])
+                                breakdown_str = "; ".join(
+                                    f"{actual_sku} | {version} | {warehouse}: {float(qty):g}"
+                                    for (actual_sku, version, warehouse), qty
+                                    in wh_breakdown.items()
+                                )
                                 record["B- Stock Breakdown"] = breakdown_str
                             else:
                                 record["B- Stock Breakdown"] = "No stock"
@@ -3599,6 +4754,8 @@ if inv_f and not df_demand.empty:
             columns=(
                 [
                     "SKU",
+                    "Requested Version",
+                    "Version Policy",
                     "Demand Quantity",
                     "Allocated Quantity",
                     "Unfulfilled Quantity",
@@ -3623,18 +4780,16 @@ if inv_f and not df_demand.empty:
         else:
             st.success("✨ All demands have been fulfilled!")
 
-        # --- Export the selected allocation into the existing order template ---
-        if not df_guide_selected.empty or not df_short.empty:
-            order_file = build_order_template(
-                df_guide_selected,
-                shortage_df=df_short
-            )
+        # Export fully resolved values so no Excel formula refresh is required.
+        if not df_guide_selected.empty:
+            order_file = build_order_csv(df_guide_selected)
             export_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             st.download_button(
-                label=f"📥 Download Plan {selected_plan_code} Order Template",
+                label=f"Download Plan {selected_plan_code} order CSV",
                 data=order_file,
-                file_name=f"SO_Template_{export_timestamp}.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                file_name=f"SO_Template_{export_timestamp}.csv",
+                mime="text/csv",
+                width="stretch",
             )
 
     except Exception as e:
