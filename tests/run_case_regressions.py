@@ -27,6 +27,12 @@ class FakeStreamlit:
 
         return decorator
 
+    def cache_resource(self, fn=None, *args, **kwargs):
+        def decorator(function):
+            return function
+
+        return decorator(fn) if fn is not None else decorator
+
 
 def load_parser_namespace():
     source = APP_PATH.read_text()

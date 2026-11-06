@@ -7,3 +7,8 @@ openpyxl>=3.1.2
 
 # AI demand extraction (Responses API)
 openai>=1.66.0
+
+# Evaluation dataset storage
+supabase>=2.0.0
+# Compatible wheel for the existing Intel-based local Python environment
+cryptography<47

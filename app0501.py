@@ -19,6 +19,7 @@ from openpyxl.styles import Alignment, Font, PatternFill
 from openpyxl.utils import get_column_letter
 from openpyxl.worksheet.datavalidation import DataValidation
 
+from evaluation_store import EvaluationStore
 from order_history import record_order_answer, record_order_detail
 import upload_processing as _upload_processing
 
@@ -37,6 +38,29 @@ from upload_processing import (
     uploaded_file_fingerprint,
     warehouse_region,
 )
+
+
+APP_VERSION = "8.8"
+
+
+@st.cache_resource
+def create_evaluation_store(supabase_url, supabase_key):
+    """Create one shared Supabase client without exposing credentials."""
+    return EvaluationStore.from_settings(
+        {"url": supabase_url, "key": supabase_key}
+    )
+
+
+def get_evaluation_store():
+    """Return the configured evaluation store, or None when unavailable."""
+    try:
+        settings = st.secrets["supabase"]
+        return create_evaluation_store(
+            str(settings["url"]),
+            str(settings["key"]),
+        )
+    except Exception:
+        return None
 
 
 def initialize_openai_api_key_from_terminal():
@@ -3005,6 +3029,9 @@ if input_method == "Paste Text":
         st.session_state.pop("paste_catalog_match_editor", None)
         st.session_state["paste_history_record_id"] = ""
         st.session_state["paste_history_error"] = ""
+        st.session_state["paste_evaluation_case_id"] = ""
+        st.session_state["paste_evaluation_error"] = ""
+        st.session_state["paste_evaluation_machine_saved"] = False
         if raw_text_input.strip():
             try:
                 history_record, history_path = record_order_detail(
@@ -3018,6 +3045,28 @@ if input_method == "Paste Text":
             except Exception as exc:
                 st.session_state["paste_history_error"] = str(exc)
 
+            evaluation_store = get_evaluation_store()
+            if evaluation_store is not None:
+                try:
+                    evaluation_case_id = evaluation_store.create_case(
+                        raw_text_input,
+                        source_type="text",
+                        ai_enabled=bool(use_ai_input),
+                        ai_model=str(ai_model) if use_ai_input else None,
+                        parser_version=APP_VERSION,
+                        input_metadata={
+                            "source": "streamlit_paste_text",
+                            "local_record_id": st.session_state.get(
+                                "paste_history_record_id", ""
+                            ),
+                        },
+                    )
+                    st.session_state["paste_evaluation_case_id"] = (
+                        evaluation_case_id
+                    )
+                except Exception as exc:
+                    st.session_state["paste_evaluation_error"] = str(exc)
+
     raw_text = st.session_state.get("submitted_paste_text", "")
     use_ai_extraction = st.session_state.get("submitted_use_ai", False)
 
@@ -3030,6 +3079,12 @@ if input_method == "Paste Text":
         else:
             record_id = st.session_state.get("paste_history_record_id", "")
             st.success(f"Order detail recorded. Record ID: {record_id[:12]}")
+        evaluation_error = st.session_state.get("paste_evaluation_error", "")
+        if evaluation_error:
+            st.warning(
+                "The order was saved locally, but the evaluation database "
+                f"could not be updated: {evaluation_error}"
+            )
 
     if raw_text:
         demand_parse_text, paste_repeat_count = collapse_repeated_paste(raw_text)
@@ -3407,6 +3462,30 @@ if input_method == "Paste Text":
                 demand_parse_text,
             )
             parser_extracted_rows = [dict(row) for row in extracted]
+
+            evaluation_case_id = st.session_state.get(
+                "paste_evaluation_case_id", ""
+            )
+            if (
+                evaluation_case_id
+                and not st.session_state.get(
+                    "paste_evaluation_machine_saved", False
+                )
+            ):
+                evaluation_store = get_evaluation_store()
+                if evaluation_store is not None:
+                    try:
+                        evaluation_store.save_machine_items(
+                            evaluation_case_id,
+                            parser_extracted_rows,
+                            parser_name=parser_used,
+                        )
+                        st.session_state[
+                            "paste_evaluation_machine_saved"
+                        ] = True
+                    except Exception as exc:
+                        st.session_state["paste_evaluation_error"] = str(exc)
+
             df_demand = pd.DataFrame(extracted)
             if parser_used == "ai":
                 extraction_label = "AI"
@@ -3461,6 +3540,20 @@ if input_method == "Paste Text":
                         "Correct answer saved and linked to this order sample. "
                         f"Answer ID: {answer_record['answer_id'][:12]}"
                     )
+
+                    evaluation_case_id = st.session_state.get(
+                        "paste_evaluation_case_id", ""
+                    )
+                    evaluation_store = get_evaluation_store()
+                    if evaluation_case_id and evaluation_store is not None:
+                        confirmed_count = evaluation_store.confirm_case(
+                            evaluation_case_id,
+                            df_demand.to_dict("records"),
+                        )
+                        st.success(
+                            f"Evaluation dataset updated with {confirmed_count} "
+                            "confirmed item(s)."
+                        )
                 except Exception as exc:
                     st.error(f"Correct answer could not be saved: {exc}")
 
