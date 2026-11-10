@@ -117,7 +117,14 @@ class EvaluationStore:
         response = self.client.table("evaluation_cases").insert(payload).execute()
         return str(response.data[0]["id"])
 
-    def find_historical_case(self, raw_input: str) -> str | None:
+    def find_imported_case(
+        self,
+        raw_input: str,
+        *,
+        dataset: str,
+        external_id: str | None = None,
+    ) -> str | None:
+        """Find a previously imported case by source dataset and external ID."""
         fingerprint = input_fingerprint(raw_input)
         response = (
             self.client.table("evaluation_cases")
@@ -127,9 +134,18 @@ class EvaluationStore:
         )
         for row in response.data or []:
             metadata = row.get("input_metadata") or {}
-            if metadata.get("dataset") == "historical_regression":
-                return str(row["id"])
+            if metadata.get("dataset") != dataset:
+                continue
+            if external_id and metadata.get("external_id") != external_id:
+                continue
+            return str(row["id"])
         return None
+
+    def find_historical_case(self, raw_input: str) -> str | None:
+        return self.find_imported_case(
+            raw_input,
+            dataset="historical_regression",
+        )
 
     def save_machine_items(
         self,
@@ -184,6 +200,12 @@ class EvaluationStore:
             base = {
                 "case_id": case_id,
                 "line_number": index + 1,
+                # Supabase requires this column to be non-null. A confirmed row
+                # with no matching machine prediction is, by definition, a row
+                # that needs review.
+                "needs_review": (
+                    bool(machine.get("needs_review")) if machine else True
+                ),
             }
             if machine:
                 for field in (
@@ -193,7 +215,6 @@ class EvaluationStore:
                     "machine_variant",
                     "machine_match_method",
                     "machine_confidence",
-                    "needs_review",
                 ):
                     base[field] = machine.get(field)
             if confirmed is None:
@@ -249,8 +270,15 @@ class EvaluationStore:
         raw_input: str,
         expected_rows: Sequence[Mapping[str, Any]],
         source_file: str,
+        dataset: str = "historical_regression",
+        external_id: str | None = None,
+        extra_metadata: Mapping[str, Any] | None = None,
     ) -> tuple[str, bool]:
-        existing_id = self.find_historical_case(raw_input)
+        existing_id = self.find_imported_case(
+            raw_input,
+            dataset=dataset,
+            external_id=external_id,
+        )
         if existing_id:
             return existing_id, False
         case_id = self.create_case(
@@ -259,9 +287,11 @@ class EvaluationStore:
             status="confirmed",
             notes="Imported historical regression case; no original machine output.",
             input_metadata={
-                "dataset": "historical_regression",
+                "dataset": dataset,
+                "external_id": external_id,
                 "title": title,
                 "source_file": source_file,
+                **dict(extra_metadata or {}),
             },
         )
         payload = []
